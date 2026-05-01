@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">App Lock</string>
+    <string name="accessibility_service_description">This service is used to detect when a protected app is opened to provide face recognition security.</string>
+</resources>
