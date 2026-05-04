@@ -1,0 +1,10 @@
+{
+  "models": [
+    {
+      "title": "DeepSeek (Together AI)",
+      "provider": "together",
+      "model": "deepseek-coder",
+      "apiKey": "tgp_v1_UAXpVkxyISVmfrhVYb_VvN71IiBOCTqldDjlKvbSywM"
+    }
+  ]
+}
