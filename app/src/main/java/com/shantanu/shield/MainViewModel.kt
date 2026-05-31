@@ -31,6 +31,8 @@ class MainViewModel @Inject constructor(
     val protectedApps = dataStoreManager.protectedApps
     val faceEmbedding = dataStoreManager.faceEmbedding
     val lockMessageType = dataStoreManager.lockMessageType
+    val lockDeviceSettings = dataStoreManager.lockDeviceSettings
+    val lockOwnApp = dataStoreManager.lockOwnApp
 
     val filteredApps: StateFlow<List<AppInfo>> = combine(_installedApps, _searchQuery, protectedApps) { apps, query, protected ->
         val list = if (query.isBlank()) apps else apps.filter { it.name.contains(query, ignoreCase = true) }
@@ -106,6 +108,14 @@ class MainViewModel @Inject constructor(
         viewModelScope.launch {
             dataStoreManager.setLockMessageType(type)
         }
+    }
+
+    fun setLockDeviceSettings(enabled: Boolean) {
+        viewModelScope.launch { dataStoreManager.setLockDeviceSettings(enabled) }
+    }
+
+    fun setLockOwnApp(enabled: Boolean) {
+        viewModelScope.launch { dataStoreManager.setLockOwnApp(enabled) }
     }
 
     fun setSearchQuery(query: String) { _searchQuery.value = query }

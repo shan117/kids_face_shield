@@ -1,6 +1,7 @@
 package com.shantanu.shield.data
 
 import android.content.Context
+import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
@@ -20,6 +21,8 @@ class DataStoreManager @Inject constructor(@ApplicationContext private val conte
     private val PROTECTED_APPS_KEY = stringSetPreferencesKey("protected_apps")
     private val FACE_EMBEDDING_KEY = stringPreferencesKey("face_embedding")
     private val LOCK_MESSAGE_TYPE_KEY = intPreferencesKey("lock_message_type")
+    private val LOCK_DEVICE_SETTINGS_KEY = booleanPreferencesKey("lock_device_settings")
+    private val LOCK_OWN_APP_KEY = booleanPreferencesKey("lock_own_app")
 
     val protectedApps: Flow<Set<String>> = context.dataStore.data.map { preferences ->
         preferences[PROTECTED_APPS_KEY] ?: emptySet()
@@ -35,6 +38,14 @@ class DataStoreManager @Inject constructor(@ApplicationContext private val conte
         preferences[LOCK_MESSAGE_TYPE_KEY] ?: 0 // 0 for hardware, 1 for health
     }
 
+    val lockDeviceSettings: Flow<Boolean> = context.dataStore.data.map { preferences ->
+        preferences[LOCK_DEVICE_SETTINGS_KEY] ?: false
+    }
+
+    val lockOwnApp: Flow<Boolean> = context.dataStore.data.map { preferences ->
+        preferences[LOCK_OWN_APP_KEY] ?: false
+    }
+
     suspend fun saveFaceEmbedding(embedding: FloatArray) {
         context.dataStore.edit { preferences ->
             preferences[FACE_EMBEDDING_KEY] = embedding.joinToString(",")
@@ -44,6 +55,18 @@ class DataStoreManager @Inject constructor(@ApplicationContext private val conte
     suspend fun setLockMessageType(type: Int) {
         context.dataStore.edit { preferences ->
             preferences[LOCK_MESSAGE_TYPE_KEY] = type
+        }
+    }
+
+    suspend fun setLockDeviceSettings(enabled: Boolean) {
+        context.dataStore.edit { preferences ->
+            preferences[LOCK_DEVICE_SETTINGS_KEY] = enabled
+        }
+    }
+
+    suspend fun setLockOwnApp(enabled: Boolean) {
+        context.dataStore.edit { preferences ->
+            preferences[LOCK_OWN_APP_KEY] = enabled
         }
     }
 

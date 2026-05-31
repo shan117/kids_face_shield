@@ -38,6 +38,8 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import java.util.*
 
+private const val REQUIRED_CONSECUTIVE_MATCHES = 3
+
 @Composable
 fun FaceLockOverlayContent(
     packageName: String,
@@ -50,10 +52,23 @@ fun FaceLockOverlayContent(
     
     val faceRecognitionManager = remember { FaceRecognitionManager(context) }
     val dataStoreManager = remember { DataStoreManager(context) }
-    
+
     var isAuthenticating by remember { mutableStateOf(false) }
     var isBlocked by remember { mutableStateOf(false) }
     var showWarningAfterDelay by remember { mutableStateOf(false) }
+    val matchStreak = remember { intArrayOf(0) }
+    // Blink-based liveness state for this lock session.
+    // A genuine human looking at the camera will, within a couple of seconds, naturally have one
+    // frame where their eyes are clearly open AND a frame where they're clearly closed (a blink).
+    // A printed photo or static image never produces that transition.
+    val livenessSeenOpen = remember { booleanArrayOf(false) }
+    val livenessSeenClosed = remember { booleanArrayOf(false) }
+    // Safety fallback: if ML Kit never returns a usable eye-open probability for this session
+    // (rare — only on devices/lighting where classification fails) we don't want to lock the user
+    // out forever. We count those "no signal" frames and, past a threshold, fall back to
+    // streak-only unlock. Photos where ML Kit DOES classify (the common case) still get
+    // blocked by the open+closed requirement.
+    val framesWithNullEyeProb = remember { intArrayOf(0) }
 
     // TTS and Media Setup
     var tts by remember { mutableStateOf<TextToSpeech?>(null) }
@@ -70,7 +85,9 @@ fun FaceLockOverlayContent(
 
     // Delay before showing warning (Genuine user window)
     LaunchedEffect(Unit) {
+        Log.d("AppLockOverlay", "Overlay composed for $packageName; starting 1500ms genuine-user window")
         delay(1500)
+        Log.d("AppLockOverlay", "1500ms elapsed for $packageName; isBlocked=$isBlocked -> showWarningAfterDelay=${!isBlocked}")
         if (!isBlocked) showWarningAfterDelay = true
     }
 
@@ -118,21 +135,45 @@ fun FaceLockOverlayContent(
                                         isAuthenticating = true
                                         coroutineScope.launch {
                                             val storedEmbedding = dataStoreManager.faceEmbedding.first()
-                                            if (storedEmbedding == null) { imageProxy.close(); return@launch }
-                                            
+                                            if (storedEmbedding == null) { imageProxy.close(); isAuthenticating = false; return@launch }
+
                                             val bitmap = ImageUtils.imageProxyToBitmap(imageProxy)
                                             imageProxy.close()
-                                            
+
                                             if (bitmap != null) {
-                                                val faceBitmap = faceRecognitionManager.detectFace(bitmap)
-                                                if (faceBitmap != null) {
-                                                    val currentEmbedding = faceRecognitionManager.getEmbedding(faceBitmap)
-                                                    if (faceRecognitionManager.isMatch(currentEmbedding, storedEmbedding)) {
-                                                        onAuthenticated()
+                                                val detected = faceRecognitionManager.detectFaceWithEyes(bitmap)
+                                                if (detected != null) {
+                                                    val eyeProb = detected.leftEyeOpenProb ?: detected.rightEyeOpenProb
+
+                                                    // Update liveness flags from this frame BEFORE deciding whether
+                                                    // to skip it. A closed-eye frame is what we need to register a
+                                                    // blink, even though we won't use it for the match itself.
+                                                    if (eyeProb != null) {
+                                                        if (eyeProb > 0.7f) livenessSeenOpen[0] = true
+                                                        if (eyeProb < 0.3f) livenessSeenClosed[0] = true
                                                     } else {
-                                                        // WRONG FACE: Set blocked state permanently for this session
-                                                        isBlocked = true
+                                                        framesWithNullEyeProb[0]++
                                                     }
+
+                                                    // Skip frames where the face clearly has its eyes shut. We do NOT
+                                                    // reset the streak here — a momentary blink in the middle of a good
+                                                    // auth sequence shouldn't force the user to start over. If ML Kit
+                                                    // couldn't classify eyes (eyeProb == null), we let the frame through.
+                                                    if (eyeProb != null && eyeProb < 0.5f) {
+                                                        Log.d("AppLockOverlay", "Eyes closed (prob=$eyeProb), skipping match for $packageName")
+                                                    } else {
+                                                        val currentEmbedding = faceRecognitionManager.getEmbedding(detected.bitmap)
+                                                        val matched = faceRecognitionManager.isMatch(currentEmbedding, storedEmbedding)
+                                                        if (matched) matchStreak[0]++ else matchStreak[0] = 0
+                                                        val classificationDead = framesWithNullEyeProb[0] >= 30
+                                                        val livenessOk = (livenessSeenOpen[0] && livenessSeenClosed[0]) || classificationDead
+                                                        Log.d("AppLockOverlay", "Face for $packageName matched=$matched streak=${matchStreak[0]} eyeProb=$eyeProb liveness=$livenessOk (open=${livenessSeenOpen[0]} closed=${livenessSeenClosed[0]} nullCnt=${framesWithNullEyeProb[0]})")
+                                                        if (matchStreak[0] >= REQUIRED_CONSECUTIVE_MATCHES && livenessOk) {
+                                                            onAuthenticated()
+                                                        }
+                                                    }
+                                                } else {
+                                                    matchStreak[0] = 0
                                                 }
                                             }
                                             isAuthenticating = false

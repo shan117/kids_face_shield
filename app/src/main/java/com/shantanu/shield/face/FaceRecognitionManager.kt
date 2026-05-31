@@ -25,12 +25,12 @@ class FaceRecognitionManager @Inject constructor(
     private var interpreter: Interpreter? = null
     private var inputSize = 112 
     private var outputSize = 128
-    private val threshold = 0.5f
+    private val threshold = 0.6f
 
     private val detector = FaceDetection.getClient(
         FaceDetectorOptions.Builder()
             .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_FAST)
-            .setClassificationMode(FaceDetectorOptions.CLASSIFICATION_MODE_NONE)
+            .setClassificationMode(FaceDetectorOptions.CLASSIFICATION_MODE_ALL)
             .build()
     )
 
@@ -68,6 +68,49 @@ class FaceRecognitionManager @Inject constructor(
                     if (width > 0 && height > 0) {
                         val faceBitmap = Bitmap.createBitmap(bitmap, left, top, width, height)
                         continuation.resume(faceBitmap)
+                    } else {
+                        continuation.resume(null)
+                    }
+                } else {
+                    continuation.resume(null)
+                }
+            }
+            .addOnFailureListener {
+                continuation.resume(null)
+            }
+    }
+
+    data class DetectedFace(
+        val bitmap: Bitmap,
+        val leftEyeOpenProb: Float?,
+        val rightEyeOpenProb: Float?
+    )
+
+    // Same crop pipeline as detectFace() — does NOT change the bitmap that gets passed to the
+    // embedder, so existing enrolments stay valid. The only addition is that we surface ML Kit's
+    // per-frame eye-open probabilities so callers can gate on liveness without ever modifying
+    // the embedding pipeline.
+    suspend fun detectFaceWithEyes(bitmap: Bitmap): DetectedFace? = suspendCancellableCoroutine { continuation ->
+        val image = InputImage.fromBitmap(bitmap, 0)
+        detector.process(image)
+            .addOnSuccessListener { faces ->
+                if (faces.isNotEmpty()) {
+                    val face = faces[0]
+                    val bounds = face.boundingBox
+                    val left = bounds.left.coerceAtLeast(0)
+                    val top = bounds.top.coerceAtLeast(0)
+                    val width = bounds.width().coerceAtMost(bitmap.width - left)
+                    val height = bounds.height().coerceAtMost(bitmap.height - top)
+
+                    if (width > 0 && height > 0) {
+                        val faceBitmap = Bitmap.createBitmap(bitmap, left, top, width, height)
+                        continuation.resume(
+                            DetectedFace(
+                                bitmap = faceBitmap,
+                                leftEyeOpenProb = face.leftEyeOpenProbability,
+                                rightEyeOpenProb = face.rightEyeOpenProbability
+                            )
+                        )
                     } else {
                         continuation.resume(null)
                     }

@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
+import android.util.Log
 import android.os.Bundle
 import android.provider.Settings
 import android.widget.Toast
@@ -20,6 +21,8 @@ import androidx.compose.animation.*
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
@@ -32,6 +35,7 @@ import androidx.compose.material3.TabRowDefaults.tabIndicatorOffset
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Color
@@ -41,20 +45,25 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import androidx.core.graphics.drawable.toBitmap
 import androidx.hilt.navigation.compose.hiltViewModel
+import com.shantanu.shield.data.DataStoreManager
 import com.shantanu.shield.face.FaceRecognitionManager
 import com.shantanu.shield.service.AppLockForegroundService
 import com.shantanu.shield.ui.theme.AppShieldTheme
 import com.shantanu.shield.util.ImageUtils
+import com.shantanu.shield.util.TamperProtection
 import dagger.hilt.android.AndroidEntryPoint
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.asExecutor
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.util.concurrent.TimeUnit
 
 @AndroidEntryPoint
@@ -65,7 +74,9 @@ class MainActivity : ComponentActivity() {
         startAppLockService()
         setContent {
             AppShieldTheme {
-                MainScreen()
+                AppLockGate {
+                    MainScreen()
+                }
             }
         }
     }
@@ -99,6 +110,94 @@ fun formatTime(millis: Long): String {
     val hours = TimeUnit.MILLISECONDS.toHours(millis)
     val minutes = TimeUnit.MILLISECONDS.toMinutes(millis) % 60
     return if (hours > 0) "${hours}h ${minutes}m" else "${minutes}m"
+}
+
+// Face-locks the whole app when "Protect This App" is enabled. Fails open (no lock) when no face
+// is enrolled or camera permission is missing, so the parent can never lock themselves out.
+@Composable
+fun AppLockGate(content: @Composable () -> Unit) {
+    val context = LocalContext.current
+    val dataStoreManager = remember { DataStoreManager(context) }
+    val lockOwnApp by dataStoreManager.lockOwnApp.collectAsState(initial = false)
+    val faceEmbedding by dataStoreManager.faceEmbedding.collectAsState(initial = null)
+    var authenticated by remember { mutableStateOf(false) }
+
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
+            if (event == androidx.lifecycle.Lifecycle.Event.ON_STOP) authenticated = false
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
+    val mustLock = lockOwnApp && faceEmbedding != null && checkCameraPermission(context) && !authenticated
+    if (mustLock) {
+        AppFaceGate(onAuthenticated = { authenticated = true })
+    } else {
+        content()
+    }
+}
+
+@Composable
+fun AppFaceGate(onAuthenticated: () -> Unit) {
+    val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
+    val coroutineScope = rememberCoroutineScope()
+    val faceRecognitionManager = remember { FaceRecognitionManager(context) }
+    val dataStoreManager = remember { DataStoreManager(context) }
+    var isVerifying by remember { mutableStateOf(false) }
+
+    Box(modifier = Modifier.fillMaxSize().background(MaterialTheme.colorScheme.surface), contentAlignment = Alignment.Center) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(32.dp)) {
+            Box(modifier = Modifier.size(120.dp).clip(CircleShape).background(MaterialTheme.colorScheme.primaryContainer), contentAlignment = Alignment.Center) {
+                Icon(Icons.Default.Lock, null, modifier = Modifier.size(56.dp), tint = MaterialTheme.colorScheme.onPrimaryContainer)
+            }
+            Spacer(Modifier.height(28.dp))
+            Text("Kids Shield is Locked", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.ExtraBold)
+            Spacer(Modifier.height(8.dp))
+            Text("Look at the camera to unlock", color = MaterialTheme.colorScheme.onSurfaceVariant, textAlign = TextAlign.Center)
+        }
+
+        // Hidden front camera continuously scanning for the enrolled face.
+        Box(modifier = Modifier.size(1.dp).alpha(0f)) {
+            AndroidView(factory = { ctx ->
+                val previewView = PreviewView(ctx)
+                val cameraProviderFuture = ProcessCameraProvider.getInstance(ctx)
+                cameraProviderFuture.addListener({
+                    val cameraProvider = cameraProviderFuture.get()
+                    val preview = Preview.Builder().build().also { it.setSurfaceProvider(previewView.surfaceProvider) }
+                    val imageAnalyzer = ImageAnalysis.Builder().setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST).build().also {
+                        it.setAnalyzer(Dispatchers.Default.asExecutor()) { imageProxy ->
+                            if (isVerifying) { imageProxy.close(); return@setAnalyzer }
+                            isVerifying = true
+                            coroutineScope.launch {
+                                val storedEmbedding = dataStoreManager.faceEmbedding.first()
+                                if (storedEmbedding == null) { imageProxy.close(); onAuthenticated(); return@launch }
+                                val bitmap = ImageUtils.imageProxyToBitmap(imageProxy)
+                                imageProxy.close()
+                                if (bitmap != null) {
+                                    val faceBitmap = faceRecognitionManager.detectFace(bitmap)
+                                    if (faceBitmap != null) {
+                                        val currentEmbedding = faceRecognitionManager.getEmbedding(faceBitmap)
+                                        if (faceRecognitionManager.isMatch(currentEmbedding, storedEmbedding)) {
+                                            withContext(Dispatchers.Main) { onAuthenticated() }
+                                        }
+                                    }
+                                }
+                                isVerifying = false
+                            }
+                        }
+                    }
+                    try {
+                        cameraProvider.unbindAll()
+                        cameraProvider.bindToLifecycle(lifecycleOwner, CameraSelector.DEFAULT_FRONT_CAMERA, preview, imageAnalyzer)
+                    } catch (e: Exception) { }
+                }, ContextCompat.getMainExecutor(ctx))
+                previewView
+            }, modifier = Modifier.fillMaxSize())
+        }
+    }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -173,7 +272,7 @@ fun MainScreen(viewModel: MainViewModel = hiltViewModel()) {
 fun SettingsScreen(viewModel: MainViewModel) {
     val lockMessageType by viewModel.lockMessageType.collectAsState(initial = 0)
 
-    Column(modifier = Modifier.fillMaxSize().padding(20.dp)) {
+    Column(modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp)) {
         Text("System Customization", style = MaterialTheme.typography.titleLarge, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
         Spacer(Modifier.height(16.dp))
 
@@ -191,7 +290,98 @@ fun SettingsScreen(viewModel: MainViewModel) {
         }
 
         Spacer(Modifier.height(24.dp))
+        TamperProtectionSection(viewModel)
+
+        Spacer(Modifier.height(24.dp))
         PermissionDashboard()
+    }
+}
+
+@Composable
+fun TamperProtectionSection(viewModel: MainViewModel) {
+    val context = LocalContext.current
+    val lockDeviceSettings by viewModel.lockDeviceSettings.collectAsState(initial = false)
+    val lockOwnApp by viewModel.lockOwnApp.collectAsState(initial = false)
+    val faceEmbedding by viewModel.faceEmbedding.collectAsState(initial = null)
+    var adminActive by remember { mutableStateOf(TamperProtection.isAdminActive(context)) }
+
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
+            if (event == androidx.lifecycle.Lifecycle.Event.ON_RESUME) {
+                adminActive = TamperProtection.isAdminActive(context)
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
+    Text("Tamper Protection", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+    Spacer(Modifier.height(12.dp))
+
+    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        TamperCard(
+            title = "Lock System Settings",
+            description = "Require Face ID to open device Settings, so a child can't reach Force-Stop, app permissions, or uninstall screens.",
+            icon = Icons.Default.Settings,
+            checked = lockDeviceSettings,
+            onCheckedChange = { viewModel.setLockDeviceSettings(it) }
+        )
+        TamperCard(
+            title = "Protect This App",
+            description = if (faceEmbedding == null)
+                "Enroll your Face ID first, then enable this to require Face ID before Kids Shield opens."
+            else
+                "Require Face ID to open Kids Shield itself, so your protection settings can't be changed.",
+            icon = Icons.Default.Lock,
+            checked = lockOwnApp,
+            enabled = faceEmbedding != null,
+            onCheckedChange = { viewModel.setLockOwnApp(it) }
+        )
+        TamperCard(
+            title = "Prevent Uninstall (Device Admin)",
+            description = "Register Kids Shield as a Device Administrator so it cannot be uninstalled. Turning this off here removes admin rights.",
+            icon = Icons.Default.Warning,
+            checked = adminActive,
+            onCheckedChange = { turnOn ->
+                if (turnOn) {
+                    context.startActivity(TamperProtection.enableAdminIntent(context))
+                } else {
+                    TamperProtection.disableAdmin(context)
+                    adminActive = false
+                }
+            }
+        )
+    }
+}
+
+@Composable
+fun TamperCard(
+    title: String,
+    description: String,
+    icon: ImageVector,
+    checked: Boolean,
+    enabled: Boolean = true,
+    onCheckedChange: (Boolean) -> Unit
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(20.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f))
+    ) {
+        Row(modifier = Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+            Box(modifier = Modifier.size(44.dp).clip(CircleShape).background(MaterialTheme.colorScheme.secondaryContainer), contentAlignment = Alignment.Center) {
+                Icon(icon, null, tint = MaterialTheme.colorScheme.onSecondaryContainer)
+            }
+            Spacer(Modifier.width(16.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                Text(title, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.bodyLarge)
+                Spacer(Modifier.height(2.dp))
+                Text(description, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            Spacer(Modifier.width(12.dp))
+            Switch(checked = checked, onCheckedChange = onCheckedChange, enabled = enabled)
+        }
     }
 }
 
@@ -334,6 +524,33 @@ fun PermissionDashboard() {
             Toast.makeText(context, "Set to 'Don't Optimize' for 24/7 protection", Toast.LENGTH_LONG).show()
             val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:${context.packageName}"))
             context.startActivity(intent)
+        }
+        ActionRow("Auto-Start / Background", "Allow Kids Shield to launch on its own") {
+            val intent = TamperProtection.autoStartIntent(context) ?: TamperProtection.appDetailsIntent(context)
+            try {
+                context.startActivity(intent)
+            } catch (e: Exception) {
+                context.startActivity(TamperProtection.appDetailsIntent(context))
+            }
+        }
+    }
+}
+
+@Composable
+fun ActionRow(title: String, subtitle: String, onClick: () -> Unit) {
+    Surface(
+        onClick = onClick,
+        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f),
+        shape = RoundedCornerShape(16.dp)
+    ) {
+        Row(modifier = Modifier.fillMaxWidth().padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
+            Icon(Icons.Default.Settings, null, tint = MaterialTheme.colorScheme.primary)
+            Spacer(Modifier.width(12.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                Text(title, fontWeight = FontWeight.Medium)
+                Text(subtitle, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            Text("Open", color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold, fontSize = 12.sp)
         }
     }
 }
