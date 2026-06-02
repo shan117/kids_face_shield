@@ -44,6 +44,7 @@ private const val REQUIRED_CONSECUTIVE_MATCHES = 3
 fun FaceLockOverlayContent(
     packageName: String,
     forcedMessageType: Int,
+    isKidModeLock: Boolean = false,
     onAuthenticated: () -> Unit
 ) {
     val context = LocalContext.current
@@ -95,7 +96,7 @@ fun FaceLockOverlayContent(
 
     // Voice trigger
     LaunchedEffect(finalShowWarning, forcedMessageType, tts) {
-        if (finalShowWarning && forcedMessageType == 2 && tts != null) {
+        if (finalShowWarning && !isKidModeLock && forcedMessageType == 2 && tts != null) {
             val resId = context.resources.getIdentifier("premanand_warning", "raw", context.packageName)
             if (resId != 0) {
                 try {
@@ -194,10 +195,14 @@ fun FaceLockOverlayContent(
 
         if (finalShowWarning) {
             Box(modifier = Modifier.fillMaxSize().background(Color.Black), contentAlignment = Alignment.Center) {
-                when (forcedMessageType) {
-                    0 -> HardwareErrorView()
-                    1 -> HealthWarningView()
-                    2 -> KidSafeAlertView()
+                if (isKidModeLock) {
+                    KidModeLockView()
+                } else {
+                    when (forcedMessageType) {
+                        0 -> HardwareErrorView()
+                        1 -> HealthWarningView()
+                        2 -> KidSafeAlertView()
+                    }
                 }
             }
         }
@@ -237,3 +242,38 @@ fun KidSafeAlertView() {
             style = MaterialTheme.typography.titleLarge, color = Color.White, textAlign = TextAlign.Center, lineHeight = 34.sp)
     }
 }
+
+@Composable
+fun KidModeLockView() {
+    Column(
+        horizontalAlignment = Alignment.CenterHorizontally,
+        modifier = Modifier.padding(32.dp)
+    ) {
+        Icon(Icons.Default.Warning, null, tint = Color(0xFFFF9800), modifier = Modifier.size(72.dp))
+        Spacer(Modifier.height(24.dp))
+        Text(
+            "Your daily usage limit is over",
+            style = MaterialTheme.typography.headlineMedium,
+            color = Color(0xFFFF9800),
+            fontWeight = FontWeight.ExtraBold,
+            textAlign = TextAlign.Center
+        )
+        Spacer(Modifier.height(20.dp))
+        Text(
+            "Please engage yourself in other activities.",
+            style = MaterialTheme.typography.titleMedium,
+            color = Color.White,
+            textAlign = TextAlign.Center
+        )
+        Spacer(Modifier.height(20.dp))
+        Text(
+            "More screen time can harm your eyes, brain, and reduce your concentration power.",
+            style = MaterialTheme.typography.bodyLarge,
+            color = Color(0xFFFFCC80),
+            textAlign = TextAlign.Center,
+            lineHeight = 26.sp
+        )
+    }
+}
+
+
