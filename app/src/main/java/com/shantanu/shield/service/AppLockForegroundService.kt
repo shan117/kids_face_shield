@@ -5,6 +5,7 @@ import android.app.usage.UsageEvents
 import android.app.usage.UsageStatsManager
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.graphics.PixelFormat
@@ -31,6 +32,7 @@ import com.shantanu.shield.data.DataStoreManager
 import com.shantanu.shield.overlay.FaceLockOverlayContent
 import dagger.hilt.android.AndroidEntryPoint
 import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.first
 import javax.inject.Inject
 
@@ -60,6 +62,13 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
     @Volatile private var cachedAdminCheckedAt: Long = 0L
     private val adminCacheTtlMs: Long = 5_000L
 
+    // Free-Play / Temp-Kid-Mode end-at (wall-clock ms). Updated by a long-running
+    // collector started in onCreate so the lock-decision path can answer sync via
+    // isFreePlayActive() without an additional DataStore read on every check.
+    @Volatile private var cachedKidSessionEndAtMs: Long = 0L
+
+    private fun isFreePlayActive(): Boolean = System.currentTimeMillis() < cachedKidSessionEndAtMs
+
     private fun isAdminActiveCached(): Boolean {
         val now = android.os.SystemClock.elapsedRealtime()
         if (now - cachedAdminCheckedAt > adminCacheTtlMs) {
@@ -85,9 +94,11 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
     private var overlayLifecycleOwner: OverlayLifecycleOwner? = null
 
     private val REAUTH_INTERVAL_MS = 60 * 1000L
-    private val POLLING_INTERVAL_MS = 250L 
+    private val POLLING_INTERVAL_MS = 250L
+    private val SCREEN_TIME_POLL_INTERVAL_MS = 60_000L
     
     private var monitorJob: Job? = null
+    private var screenTimePollJob: Job? = null
     private val launcherPackages = mutableSetOf<String>()
     private val settingsPackages = mutableSetOf<String>()
     // Settings activities that act as the app's "home / entry" — i.e. what launches when the user
@@ -161,6 +172,14 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
             Log.e("AppLock", "startForeground failed in onCreate", e)
         }
         startAppMonitoring()
+        startScreenTimePolling()
+        // Keep the Free-Play cache in lock-step with DataStore so the lock decision
+        // path can answer synchronously. Collector exits when the service does.
+        serviceScope.launch {
+            dataStoreManager.kidSessionEndAt.collect { endAt ->
+                cachedKidSessionEndAtMs = endAt
+            }
+        }
     }
 
     private fun startAppMonitoring() {
@@ -202,6 +221,160 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
         }
     }
 
+    // -------------------------------------------------------------------------
+    // Phase 4 — Screen-time polling.
+    //
+    // Every 60s we ask UsageStatsManager for total foreground time per package
+    // since the most recent 07:00 cutoff, exclude system apps + always-allowed
+    // apps + our own package, and store the controlled total in DataStore so
+    // the Kid Mode tab's "Today" card can render live numbers.
+    //
+    // We also handle the daily extension reset here: at the 07:00 boundary the
+    // window naturally rolls (so used-time drops to 0 from UsageStats), but
+    // extensionsTodayMs is bookkeeping that needs an explicit reset.
+    // -------------------------------------------------------------------------
+    private fun startScreenTimePolling() {
+        screenTimePollJob?.cancel()
+        screenTimePollJob = serviceScope.launch {
+            Log.d("ScreenTime", "Screen-time polling started.")
+            while (isActive) {
+                try {
+                    pollScreenTime()
+                } catch (t: Throwable) {
+                    Log.e("ScreenTime", "poll failed: ${t.message}", t)
+                }
+                delay(SCREEN_TIME_POLL_INTERVAL_MS)
+            }
+        }
+    }
+
+    private suspend fun pollScreenTime() {
+        val now = System.currentTimeMillis()
+
+        // Per-day reset: if the day-key changed since last seen, zero out today's
+        // extensions and stamp the new key.
+        val todayKey = dayKeyForBudget(now)
+        val lastReset = dataStoreManager.screenTimeLastResetDate.first()
+        if (todayKey != lastReset) {
+            dataStoreManager.setExtensionsTodayMs(0L)
+            dataStoreManager.setScreenTimeLastResetDate(todayKey)
+            Log.d("ScreenTime", "Daily reset: extensions zeroed for $todayKey")
+        }
+
+        val windowStart = mostRecentSevenAm(now)
+        val usm = getSystemService(Context.USAGE_STATS_SERVICE) as UsageStatsManager
+        val stats = usm.queryAndAggregateUsageStats(windowStart, now) ?: return
+        if (stats.isEmpty()) {
+            // No permission or no events — nothing to do.
+            return
+        }
+
+        val allowed = com.shantanu.shield.util.AllowedApps.computeAlwaysAllowedSet(this, dataStoreManager)
+        val pm = packageManager
+        var controlledMs = 0L
+        for ((pkg, stat) in stats) {
+            if (pkg in allowed) continue
+            if (pkg == packageName) continue
+            // Only user-installed Play-Store apps count against the budget. All
+            // system apps (Phone, Messages, Settings, Camera, Clock, the launcher,
+            // even updated-system apps like Google Phone on Pixel) are excluded so
+            // their usage doesn't eat into the kid's screen-time quota.
+            val flags = try {
+                pm.getApplicationInfo(pkg, 0).flags
+            } catch (_: PackageManager.NameNotFoundException) {
+                continue
+            }
+            val isSystem = (flags and ApplicationInfo.FLAG_SYSTEM) != 0
+            if (isSystem) continue
+
+            controlledMs += stat.totalTimeInForeground
+        }
+        dataStoreManager.setScreenTimeUsedMs(controlledMs)
+    }
+
+    // Most-recent 07:00 boundary: today's 07:00 if we're past it, else yesterday's 07:00.
+    private fun mostRecentSevenAm(nowMs: Long): Long {
+        val cal = java.util.Calendar.getInstance()
+        cal.timeInMillis = nowMs
+        if (cal.get(java.util.Calendar.HOUR_OF_DAY) < 7) {
+            cal.add(java.util.Calendar.DAY_OF_YEAR, -1)
+        }
+        cal.set(java.util.Calendar.HOUR_OF_DAY, 7)
+        cal.set(java.util.Calendar.MINUTE, 0)
+        cal.set(java.util.Calendar.SECOND, 0)
+        cal.set(java.util.Calendar.MILLISECOND, 0)
+        return cal.timeInMillis
+    }
+
+    // YYYY-MM-DD key for the budget-day containing nowMs. The budget-day starts at
+    // 07:00, so 02:00 on May 5 belongs to budget-day "2026-05-04".
+    private fun dayKeyForBudget(nowMs: Long): String {
+        val cal = java.util.Calendar.getInstance()
+        cal.timeInMillis = nowMs
+        if (cal.get(java.util.Calendar.HOUR_OF_DAY) < 7) {
+            cal.add(java.util.Calendar.DAY_OF_YEAR, -1)
+        }
+        return String.format(
+            "%04d-%02d-%02d",
+            cal.get(java.util.Calendar.YEAR),
+            cal.get(java.util.Calendar.MONTH) + 1,
+            cal.get(java.util.Calendar.DAY_OF_MONTH)
+        )
+    }
+
+    // -------------------------------------------------------------------------
+    // Phase 5 — Kid Mode enforcement.
+    //
+    // shouldLockForKidMode answers: "in this exact moment, should we force a
+    // face-auth on this package because the kid is using it past the budget
+    // or during the 22:00-06:59 night window?"
+    //
+    // Returns false fast when owner is Parent so the parent-only path is
+    // unaffected. Returns false for system apps, our own app, and packages in
+    // the always-allowed set so emergency comms (Phone/SMS/WhatsApp) keep working.
+    // -------------------------------------------------------------------------
+    private suspend fun shouldLockForKidMode(pkg: String, nowMs: Long): Boolean {
+        val ownerType = dataStoreManager.ownerType.first()
+        if (ownerType != "kid") return false
+        if (pkg == this.packageName) return false
+
+        // All system apps are unrestricted in Kid Mode (Phone, Messages, Settings,
+        // Camera, Clock, etc. — both pure system AND updated-system apps like the
+        // Google Phone/Messages dialer on Pixels). The user-installed Play Store apps
+        // are the only ones the budget applies to. Settings can still be locked
+        // independently via the parent-mode `lockDeviceSettings` toggle (which uses
+        // the `protectedApps` path and runs regardless of owner type).
+        val flags = try {
+            packageManager.getApplicationInfo(pkg, 0).flags
+        } catch (_: PackageManager.NameNotFoundException) {
+            return false
+        }
+        val isSystem = (flags and ApplicationInfo.FLAG_SYSTEM) != 0
+        if (isSystem) return false
+
+        val allowed = com.shantanu.shield.util.AllowedApps.computeAlwaysAllowedSet(this, dataStoreManager)
+        if (pkg in allowed) return false
+
+        // Hard lock during the configured night window — irrespective of budget.
+        if (isNightWindow(nowMs)) return true
+
+        // Budget-exhausted check (day window only).
+        val limit = dataStoreManager.dailyLimitMinutes.first()
+        val used = dataStoreManager.screenTimeUsedMs.first()
+        val extensions = dataStoreManager.extensionsTodayMs.first()
+        val usedMin = (used / 60_000L).toInt()
+        val extensionMin = (extensions / 60_000L).toInt()
+        return usedMin >= limit + extensionMin
+    }
+
+    private fun isNightWindow(nowMs: Long): Boolean {
+        val cal = java.util.Calendar.getInstance()
+        cal.timeInMillis = nowMs
+        val hour = cal.get(java.util.Calendar.HOUR_OF_DAY)
+        // Night-lock window: 22:00 inclusive to 06:59 inclusive (i.e. open at 07:00 sharp).
+        return hour >= 22 || hour < 7
+    }
+
     // The effective protected set = user-selected apps, plus the system Settings package when the
     // parent has enabled "Lock System Settings" (closes the Force-Stop / App-Info side door).
     private suspend fun effectiveProtectedApps(): Set<String> {
@@ -226,9 +399,13 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
             val isCriticalSideDoor = isCriticalSettingsClass(pkg, cls)
             val adminActive = isAdminActiveCached()
             val challengeCritical = isCriticalSideDoor && adminActive
+            val kidModeLock = shouldLockForKidMode(pkg, System.currentTimeMillis())
+            val freePlayActive = isFreePlayActive()
             val shouldLock = when {
                 challengeCritical -> true
+                freePlayActive -> false
                 protectedApps.contains(pkg) && !isSettingsSubPage(pkg, cls) -> true
+                kidModeLock -> true
                 else -> false
             }
             if (!shouldLock) return@launch
@@ -236,9 +413,9 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
             val sessionValid = (currentlyUnlockedPackage == pkg && (currentTime - lastAuthTime) < REAUTH_INTERVAL_MS)
             if (sessionValid) return@launch
             if (isLockActive) return@launch
-            Log.d("AppLock", "Watchdog: $pkg foreground without overlay (critical=$challengeCritical). Forcing show.")
+            Log.d("AppLock", "Watchdog: $pkg foreground without overlay (critical=$challengeCritical kid=$kidModeLock). Forcing show.")
             withContext(Dispatchers.Main) {
-                if (!isLockActive) enforceLock(pkg, System.currentTimeMillis())
+                if (!isLockActive) enforceLock(pkg, System.currentTimeMillis(), forceActivity = kidModeLock, isKidModeLock = kidModeLock)
             }
         }
     }
@@ -293,7 +470,11 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
     }
 
     private fun handlePackageChange(packageName: String, className: String?, eventTime: Long = System.currentTimeMillis()) {
-        if (packageName == this.packageName) return
+        // Self-processing is normally skipped to avoid the service trying to lock
+        // its own UI. During a Free-Play session, however, we DO want to lock the
+        // FaceShield app so the kid can't open Settings inside it — so we let the
+        // handler run for self in that case and rely on the lock check below.
+        if (packageName == this.packageName && !isFreePlayActive()) return
 
         val isSystemUI = packageName == "com.android.systemui"
         val isHome = launcherPackages.contains(packageName) || packageName == "unknown"
@@ -350,16 +531,24 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
             // is off — they are the only two doors the user could otherwise walk through to remove
             // our protection.
             val challengeCritical = isCriticalSideDoor && adminActive
+            val kidModeLock = shouldLockForKidMode(packageName, System.currentTimeMillis())
+            val freePlayActive = isFreePlayActive()
+            val freePlaySelfLock = freePlayActive && packageName == this@AppLockForegroundService.packageName
             val shouldLock = when {
                 challengeCritical -> true
+                freePlaySelfLock -> true
+                freePlayActive -> false
                 protectedApps.contains(packageName) && !isSettingsSubPage(packageName, className) -> true
+                kidModeLock -> true
                 else -> false
             }
             if (shouldLock) {
                 val currentTime = System.currentTimeMillis()
                 val sessionValid = (currentlyUnlockedPackage == packageName && (currentTime - lastAuthTime) < REAUTH_INTERVAL_MS)
                 if (!sessionValid) {
-                    enforceLock(packageName, eventTime)
+                    if (kidModeLock) Log.d("AppLock", "Kid Mode lock fired for $packageName")
+                    if (freePlaySelfLock) Log.d("AppLock", "Free-Play self-lock fired for $packageName")
+                    enforceLock(packageName, eventTime, forceActivity = kidModeLock, isKidModeLock = kidModeLock)
                 }
             } else if (!protectedApps.contains(packageName)) {
                 // Leaving protected app to an unprotected one (or skipping a bypassable sub-page).
@@ -399,15 +588,19 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
 
     // Choose the enforcement mechanism: a full-screen Activity for targets that force-hide
     // overlay windows (Settings), and the lightweight overlay for everything else.
-    private fun enforceLock(packageName: String, eventTime: Long) {
-        if (settingsPackages.contains(packageName)) {
-            launchLockActivity(packageName, eventTime)
+    // forceActivity=true is used by Kid Mode locks. The overlay path can be partially bypassed
+    // on some OEMs (system gestures, the brief gap between Home → re-open recents → re-foreground),
+    // so kid-mode goes through the same robust full-screen LockActivity the system Settings lock
+    // uses. Back/Home from LockActivity sends the user Home and re-arms the lock on next entry.
+    private fun enforceLock(packageName: String, eventTime: Long, forceActivity: Boolean = false, isKidModeLock: Boolean = false) {
+        if (settingsPackages.contains(packageName) || forceActivity) {
+            launchLockActivity(packageName, eventTime, isKidModeLock)
         } else {
             showOverlay(packageName, eventTime)
         }
     }
 
-    private fun launchLockActivity(packageName: String, eventTime: Long) {
+    private fun launchLockActivity(packageName: String, eventTime: Long, isKidModeLock: Boolean = false) {
         if (activityLockActive && activityLockPackage == packageName) return
         activityLockActive = true
         activityLockPackage = packageName
@@ -417,8 +610,8 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
             val msgType = dataStoreManager.lockMessageType.first()
             withContext(Dispatchers.Main) {
                 try {
-                    startActivity(LockActivity.newIntent(this@AppLockForegroundService, packageName, msgType))
-                    Log.d("AppLock", "launchLockActivity pkg=$packageName eventTime=$eventTime")
+                    startActivity(LockActivity.newIntent(this@AppLockForegroundService, packageName, msgType, isKidModeLock))
+                    Log.d("AppLock", "launchLockActivity pkg=$packageName eventTime=$eventTime kidMode=$isKidModeLock")
                 } catch (e: Exception) {
                     Log.e("AppLock", "Failed to launch LockActivity", e)
                     activityLockActive = false
@@ -718,6 +911,7 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
     override fun onDestroy() {
         super.onDestroy()
         monitorJob?.cancel()
+        screenTimePollJob?.cancel()
         hideOverlay()
         mainHandler.removeCallbacks(downgradeFgsTask)
         serviceLifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_DESTROY)
