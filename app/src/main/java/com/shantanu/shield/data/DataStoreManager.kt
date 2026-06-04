@@ -40,6 +40,19 @@ class DataStoreManager @Inject constructor(@ApplicationContext private val conte
     // ends. 0 (or any value < now) means no session is active.
     private val KID_SESSION_END_AT_KEY = longPreferencesKey("kid_session_end_at")
 
+    // First-run welcome / setup wizard. True once the user has completed or skipped it.
+    private val FIRST_RUN_COMPLETED_KEY = booleanPreferencesKey("first_run_completed")
+
+    // Coach-marks / in-app guide toggle + per-tour "already seen" set.
+    private val COACH_MARKS_ENABLED_KEY = booleanPreferencesKey("coach_marks_enabled")
+    private val SEEN_TOURS_KEY = stringSetPreferencesKey("seen_tours")
+
+    // Free-Play session history. Serialized as "startMs,endMs,grantedMs;..." with a
+    // 90-day TTL pruned at write time. Used by the Stats tab to attribute usage to
+    // Free Play windows and to render per-day Free Play minutes granted.
+    private val FREE_PLAY_HISTORY_KEY = stringPreferencesKey("free_play_history")
+    private val FREE_PLAY_HISTORY_MAX_AGE_MS = 90L * 24 * 60 * 60 * 1000
+
     val protectedApps: Flow<Set<String>> = context.dataStore.data.map { preferences ->
         preferences[PROTECTED_APPS_KEY] ?: emptySet()
     }
@@ -97,6 +110,22 @@ class DataStoreManager @Inject constructor(@ApplicationContext private val conte
 
     val kidSessionEndAt: Flow<Long> = context.dataStore.data.map { preferences ->
         preferences[KID_SESSION_END_AT_KEY] ?: 0L
+    }
+
+    val firstRunCompleted: Flow<Boolean> = context.dataStore.data.map { preferences ->
+        preferences[FIRST_RUN_COMPLETED_KEY] ?: false
+    }
+
+    val coachMarksEnabled: Flow<Boolean> = context.dataStore.data.map { preferences ->
+        preferences[COACH_MARKS_ENABLED_KEY] ?: true
+    }
+
+    val seenTours: Flow<Set<String>> = context.dataStore.data.map { preferences ->
+        preferences[SEEN_TOURS_KEY] ?: emptySet()
+    }
+
+    val freePlayHistory: Flow<List<FreePlayRecord>> = context.dataStore.data.map { preferences ->
+        parseFreePlayHistory(preferences[FREE_PLAY_HISTORY_KEY] ?: "")
     }
 
     suspend fun saveFaceEmbedding(embedding: FloatArray) {
@@ -205,4 +234,54 @@ class DataStoreManager @Inject constructor(@ApplicationContext private val conte
             preferences[KID_SESSION_END_AT_KEY] = endAtMs
         }
     }
+
+    suspend fun setFirstRunCompleted(value: Boolean) {
+        context.dataStore.edit { preferences ->
+            preferences[FIRST_RUN_COMPLETED_KEY] = value
+        }
+    }
+
+    suspend fun setCoachMarksEnabled(value: Boolean) {
+        context.dataStore.edit { preferences ->
+            preferences[COACH_MARKS_ENABLED_KEY] = value
+        }
+    }
+
+    suspend fun markTourSeen(tourId: String) {
+        context.dataStore.edit { preferences ->
+            preferences[SEEN_TOURS_KEY] = (preferences[SEEN_TOURS_KEY] ?: emptySet()) + tourId
+        }
+    }
+
+    suspend fun resetSeenTours() {
+        context.dataStore.edit { preferences ->
+            preferences[SEEN_TOURS_KEY] = emptySet()
+        }
+    }
+
+    suspend fun appendFreePlayRecord(startMs: Long, endMs: Long, grantedMs: Long) {
+        context.dataStore.edit { preferences ->
+            val cutoff = System.currentTimeMillis() - FREE_PLAY_HISTORY_MAX_AGE_MS
+            val pruned = parseFreePlayHistory(preferences[FREE_PLAY_HISTORY_KEY] ?: "")
+                .filter { it.endMs >= cutoff }
+            val updated = pruned + FreePlayRecord(startMs, endMs, grantedMs)
+            preferences[FREE_PLAY_HISTORY_KEY] = serializeFreePlayHistory(updated)
+        }
+    }
+
+    private fun parseFreePlayHistory(raw: String): List<FreePlayRecord> {
+        if (raw.isBlank()) return emptyList()
+        return raw.split(";").mapNotNull { entry ->
+            val parts = entry.split(",")
+            if (parts.size != 3) return@mapNotNull null
+            runCatching {
+                FreePlayRecord(parts[0].toLong(), parts[1].toLong(), parts[2].toLong())
+            }.getOrNull()
+        }
+    }
+
+    private fun serializeFreePlayHistory(records: List<FreePlayRecord>): String =
+        records.joinToString(";") { "${it.startMs},${it.endMs},${it.grantedMs}" }
 }
+
+data class FreePlayRecord(val startMs: Long, val endMs: Long, val grantedMs: Long)

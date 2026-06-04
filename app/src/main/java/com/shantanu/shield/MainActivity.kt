@@ -48,6 +48,10 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.compose.ui.semantics.LiveRegionMode
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.liveRegion
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
@@ -60,7 +64,9 @@ import androidx.hilt.navigation.compose.hiltViewModel
 import com.shantanu.shield.data.DataStoreManager
 import com.shantanu.shield.face.FaceRecognitionManager
 import com.shantanu.shield.service.AppLockForegroundService
+import com.shantanu.shield.ui.coachTarget
 import com.shantanu.shield.ui.theme.AppShieldTheme
+import com.shantanu.shield.util.AppCategory
 import com.shantanu.shield.util.ImageUtils
 import com.shantanu.shield.util.TamperProtection
 import dagger.hilt.android.AndroidEntryPoint
@@ -145,6 +151,8 @@ fun AppLockGate(content: @Composable () -> Unit) {
     }
 }
 
+private enum class AppFaceAuthStatus { SEARCHING, NO_MATCH }
+
 @Composable
 fun AppFaceGate(onAuthenticated: () -> Unit) {
     val context = LocalContext.current
@@ -153,16 +161,53 @@ fun AppFaceGate(onAuthenticated: () -> Unit) {
     val faceRecognitionManager = remember { FaceRecognitionManager(context) }
     val dataStoreManager = remember { DataStoreManager(context) }
     var isVerifying by remember { mutableStateOf(false) }
+    var status by remember { mutableStateOf(AppFaceAuthStatus.SEARCHING) }
+    var failedAttempts by remember { mutableIntStateOf(0) }
+    var lastFaceSeenAtMs by remember { mutableLongStateOf(0L) }
+
+    LaunchedEffect(status) {
+        // After ~2.5s with no face seen, revert NO_MATCH back to SEARCHING so
+        // the screen doesn't keep accusing the user once they look away.
+        while (status == AppFaceAuthStatus.NO_MATCH) {
+            kotlinx.coroutines.delay(500)
+            if (System.currentTimeMillis() - lastFaceSeenAtMs > 2500L) {
+                status = AppFaceAuthStatus.SEARCHING
+            }
+        }
+    }
+
+    val isNoMatch = status == AppFaceAuthStatus.NO_MATCH
+    val iconBg = if (isNoMatch) MaterialTheme.colorScheme.errorContainer else MaterialTheme.colorScheme.primaryContainer
+    val iconTint = if (isNoMatch) MaterialTheme.colorScheme.onErrorContainer else MaterialTheme.colorScheme.onPrimaryContainer
+    val title = if (isNoMatch) "Face didn't match" else "Kids Shield is Locked"
+    val subtitle = if (isNoMatch)
+        "Only the enrolled face can unlock this app. Make sure you're in good light and try again."
+    else
+        "Look at the camera to unlock"
 
     Box(modifier = Modifier.fillMaxSize().background(MaterialTheme.colorScheme.surface), contentAlignment = Alignment.Center) {
         Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(32.dp)) {
-            Box(modifier = Modifier.size(120.dp).clip(CircleShape).background(MaterialTheme.colorScheme.primaryContainer), contentAlignment = Alignment.Center) {
-                Icon(Icons.Default.Lock, null, modifier = Modifier.size(56.dp), tint = MaterialTheme.colorScheme.onPrimaryContainer)
+            Box(modifier = Modifier.size(120.dp).clip(CircleShape).background(iconBg), contentAlignment = Alignment.Center) {
+                Icon(
+                    imageVector = if (isNoMatch) Icons.Default.Close else Icons.Default.Lock,
+                    contentDescription = null,
+                    modifier = Modifier.size(56.dp),
+                    tint = iconTint
+                )
             }
             Spacer(Modifier.height(28.dp))
-            Text("Kids Shield is Locked", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.ExtraBold)
+            Text(title, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.ExtraBold)
             Spacer(Modifier.height(8.dp))
-            Text("Look at the camera to unlock", color = MaterialTheme.colorScheme.onSurfaceVariant, textAlign = TextAlign.Center)
+            Text(subtitle, color = MaterialTheme.colorScheme.onSurfaceVariant, textAlign = TextAlign.Center)
+            if (isNoMatch && failedAttempts > 0) {
+                Spacer(Modifier.height(16.dp))
+                Text(
+                    text = "Failed attempts: $failedAttempts",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.error,
+                    fontWeight = FontWeight.SemiBold
+                )
+            }
         }
 
         // Hidden front camera continuously scanning for the enrolled face.
@@ -186,8 +231,17 @@ fun AppFaceGate(onAuthenticated: () -> Unit) {
                                     val faceBitmap = faceRecognitionManager.detectFace(bitmap)
                                     if (faceBitmap != null) {
                                         val currentEmbedding = faceRecognitionManager.getEmbedding(faceBitmap)
+                                        val now = System.currentTimeMillis()
                                         if (faceRecognitionManager.isMatch(currentEmbedding, storedEmbedding)) {
                                             withContext(Dispatchers.Main) { onAuthenticated() }
+                                        } else {
+                                            withContext(Dispatchers.Main) {
+                                                // Count attempts at most ~1/second so a wrong-face hold
+                                                // doesn't inflate the counter every frame.
+                                                if (now - lastFaceSeenAtMs > 900L) failedAttempts++
+                                                lastFaceSeenAtMs = now
+                                                status = AppFaceAuthStatus.NO_MATCH
+                                            }
                                         }
                                     }
                                 }
@@ -206,30 +260,96 @@ fun AppFaceGate(onAuthenticated: () -> Unit) {
     }
 }
 
+// Shared snackbar host so any screen can post short feedback ("Gmail now requires
+// face unlock", "Free Play started · 30 min") without plumbing the state through
+// every composable. Provided at MainScreen and read via LocalSnackbarHostState.
+val LocalSnackbarHostState = staticCompositionLocalOf<SnackbarHostState> {
+    error("LocalSnackbarHostState not provided")
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun MainScreen(viewModel: MainViewModel = hiltViewModel()) {
-    var selectedTab by remember { mutableIntStateOf(0) }
+    val firstRunCompleted by viewModel.firstRunCompleted.collectAsState(initial = null)
+    var enrollingFromWizard by remember { mutableStateOf(false) }
+    var selectedTab by remember { mutableIntStateOf(1) }
+    val snackbarHostState = remember { SnackbarHostState() }
+    val coachMarks = remember { com.shantanu.shield.ui.CoachMarkController() }
+    val seenTours by viewModel.seenTours.collectAsState(initial = emptySet())
 
+    if (firstRunCompleted == null) {
+        // DataStore loading — render empty to avoid flashing the wizard.
+        Box(modifier = Modifier.fillMaxSize().background(MaterialTheme.colorScheme.surface))
+        return
+    }
+
+    if (firstRunCompleted == false) {
+        if (enrollingFromWizard) {
+            FaceEnrollmentScreen(viewModel)
+            val faceEmbedding by viewModel.faceEmbedding.collectAsState(initial = null)
+            LaunchedEffect(faceEmbedding) {
+                if (faceEmbedding != null) enrollingFromWizard = false
+            }
+            return
+        }
+        FirstRunWelcome(
+            viewModel = viewModel,
+            onOpenFaceEnrol = { enrollingFromWizard = true },
+            onFinish = { viewModel.setFirstRunCompleted(true) }
+        )
+        return
+    }
+
+    // Once first-run is complete, kick off the welcome coach-mark tour exactly once
+    // for any user who hasn't yet seen it. Delay until selectedTab == 1 (Protect) so
+    // the highlighted targets are composed before the overlay reads their bounds.
+    LaunchedEffect(firstRunCompleted, seenTours, selectedTab) {
+        if (firstRunCompleted == true &&
+            selectedTab == 1 &&
+            !seenTours.contains(com.shantanu.shield.ui.CoachTours.FIRST_RUN_ID) &&
+            !coachMarks.visible
+        ) {
+            kotlinx.coroutines.delay(600)
+            coachMarks.start(
+                com.shantanu.shield.ui.CoachTours.FIRST_RUN_ID,
+                com.shantanu.shield.ui.CoachTours.FIRST_RUN
+            )
+        }
+    }
+
+    val topBarOverride = remember { mutableStateOf<com.shantanu.shield.ui.TopBarOverride?>(null) }
+    CompositionLocalProvider(
+        LocalSnackbarHostState provides snackbarHostState,
+        com.shantanu.shield.ui.LocalCoachMarks provides coachMarks,
+        com.shantanu.shield.ui.LocalRequestTab provides { tab -> selectedTab = tab },
+        com.shantanu.shield.ui.LocalTopBarOverride provides topBarOverride
+    ) {
+    Box(modifier = Modifier.fillMaxSize()) {
     Scaffold(
-        topBar = {
-            CenterAlignedTopAppBar(
-                title = { 
-                    Text(
-                        text = when(selectedTab) {
-                            0 -> "Usage Insight"
-                            1 -> "Face ID"
-                            2 -> "App Shield"
-                            3 -> "Kid Mode"
-                            else -> "Security Hub"
-                        },
-                        fontWeight = FontWeight.ExtraBold,
-                        letterSpacing = 0.5.sp
-                    )
-                },
-                colors = TopAppBarDefaults.centerAlignedTopAppBarColors(
-                    containerColor = MaterialTheme.colorScheme.surface
+        snackbarHost = {
+            SnackbarHost(snackbarHostState) { data ->
+                Snackbar(
+                    snackbarData = data,
+                    shape = RoundedCornerShape(16.dp),
+                    containerColor = MaterialTheme.colorScheme.secondaryContainer,
+                    contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
+                    actionColor = MaterialTheme.colorScheme.primary,
+                    actionContentColor = MaterialTheme.colorScheme.primary,
+                    dismissActionContentColor = MaterialTheme.colorScheme.onSecondaryContainer
                 )
+            }
+        },
+        topBar = {
+            val override = topBarOverride.value
+            com.shantanu.shield.ui.KfsTopBar(
+                title = override?.title ?: when(selectedTab) {
+                    0 -> "Face ID"
+                    1 -> "App Shield"
+                    2 -> "Settings"
+                    3 -> "Stats"
+                    else -> "App Shield"
+                },
+                onBack = override?.onBack
             )
         },
         bottomBar = {
@@ -237,26 +357,28 @@ fun MainScreen(viewModel: MainViewModel = hiltViewModel()) {
                 NavigationBarItem(
                     selected = selectedTab == 0,
                     onClick = { selectedTab = 0 },
-                    icon = { Icon(Icons.AutoMirrored.Filled.List, null) },
-                    label = { Text("Usage") }
+                    icon = { Icon(Icons.Default.Face, null) },
+                    label = { Text("Face") }
                 )
                 NavigationBarItem(
                     selected = selectedTab == 1,
                     onClick = { selectedTab = 1 },
-                    icon = { Icon(Icons.Default.Face, null) },
-                    label = { Text("Enroll") }
-                )
-                NavigationBarItem(
-                    selected = selectedTab == 2,
-                    onClick = { selectedTab = 2 },
                     icon = { Icon(Icons.Default.Lock, null) },
                     label = { Text("Protect") }
                 )
                 NavigationBarItem(
+                    selected = selectedTab == 2,
+                    onClick = { selectedTab = 2 },
+                    icon = { Icon(Icons.Default.Settings, null) },
+                    label = { Text("Settings") },
+                    modifier = Modifier.coachTarget("settings-tab")
+                )
+                NavigationBarItem(
                     selected = selectedTab == 3,
                     onClick = { selectedTab = 3 },
-                    icon = { Icon(Icons.Default.Settings, null) },
-                    label = { Text("Setup") }
+                    icon = { Icon(Icons.AutoMirrored.Filled.List, null) },
+                    label = { Text("Stats") },
+                    modifier = Modifier.coachTarget("stats-tab")
                 )
             }
         }
@@ -266,11 +388,315 @@ fun MainScreen(viewModel: MainViewModel = hiltViewModel()) {
             color = MaterialTheme.colorScheme.surface
         ) {
             when (selectedTab) {
-                0 -> UsageDashboardScreen(viewModel)
-                1 -> FaceEnrollmentScreen(viewModel)
-                2 -> ProtectScreen(viewModel)
-                3 -> SettingsScreen(viewModel)
+                0 -> FaceEnrollmentScreen(viewModel)
+                1 -> ProtectScreen(viewModel)
+                2 -> SettingsScreen(viewModel)
+                3 -> com.shantanu.shield.ui.stats.StatsScreen()
             }
+        }
+    }
+        com.shantanu.shield.ui.CoachMarkOverlay(
+            controller = coachMarks,
+            onTourComplete = { tourId -> viewModel.markTourSeen(tourId) }
+        )
+    }
+    }
+}
+
+// ============================================================================
+// First-run welcome screen. Shown only once: until the user taps "Get Started"
+// (or "Skip"), which flips firstRunCompleted to true. Single fullscreen page
+// — no multi-step wizard — listing the 4 setup tasks. Each task auto-checks
+// once satisfied, so the user can grant in any order and see progress live.
+// ============================================================================
+@Composable
+private fun FirstRunWelcome(
+    viewModel: MainViewModel,
+    onOpenFaceEnrol: () -> Unit,
+    onFinish: () -> Unit
+) {
+    val context = LocalContext.current
+    val faceEmbedding by viewModel.faceEmbedding.collectAsState(initial = null)
+    var cameraGranted by remember { mutableStateOf(checkCameraPermission(context)) }
+    var usageGranted by remember { mutableStateOf(isUsageStatsPermissionGranted(context)) }
+    var overlayGranted by remember { mutableStateOf(Settings.canDrawOverlays(context)) }
+
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val obs = androidx.lifecycle.LifecycleEventObserver { _, e ->
+            if (e == androidx.lifecycle.Lifecycle.Event.ON_RESUME) {
+                cameraGranted = checkCameraPermission(context)
+                usageGranted = isUsageStatsPermissionGranted(context)
+                overlayGranted = Settings.canDrawOverlays(context)
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(obs)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(obs) }
+    }
+    val cameraLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { cameraGranted = it }
+
+    val faceEnrolled = faceEmbedding != null
+    val allDone = faceEnrolled && cameraGranted && usageGranted && overlayGranted
+
+    Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.surface) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 24.dp, vertical = 32.dp)
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(96.dp)
+                    .clip(CircleShape)
+                    .background(MaterialTheme.colorScheme.primaryContainer)
+                    .align(Alignment.CenterHorizontally),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(
+                    Icons.Default.Lock,
+                    contentDescription = null,
+                    modifier = Modifier.size(44.dp),
+                    tint = MaterialTheme.colorScheme.onPrimaryContainer
+                )
+            }
+            Spacer(Modifier.height(24.dp))
+            Text(
+                "Welcome to Kids Face Shield",
+                style = MaterialTheme.typography.headlineSmall,
+                fontWeight = FontWeight.ExtraBold,
+                modifier = Modifier.align(Alignment.CenterHorizontally)
+            )
+            Spacer(Modifier.height(12.dp))
+            Text(
+                "Shield apps on your phone behind your face. Lend the phone to a kid via Free Play, or set up Kid Mode with a daily screen-time budget.",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                textAlign = TextAlign.Center,
+                modifier = Modifier.align(Alignment.CenterHorizontally)
+            )
+            Spacer(Modifier.height(32.dp))
+            Text(
+                "Quick setup",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.Bold
+            )
+            Spacer(Modifier.height(12.dp))
+
+            SetupTaskRow(
+                title = "Enrol your face",
+                subtitle = "Required to unlock protected apps",
+                done = faceEnrolled,
+                actionLabel = if (faceEnrolled) null else "Open camera",
+                onAction = onOpenFaceEnrol
+            )
+            Spacer(Modifier.height(8.dp))
+            SetupTaskRow(
+                title = "Camera permission",
+                subtitle = "Needed for face scanning",
+                done = cameraGranted,
+                actionLabel = if (cameraGranted) null else "Grant",
+                onAction = { cameraLauncher.launch(Manifest.permission.CAMERA) }
+            )
+            Spacer(Modifier.height(8.dp))
+            SetupTaskRow(
+                title = "Usage Access",
+                subtitle = "Detect which app is on screen",
+                done = usageGranted,
+                actionLabel = if (usageGranted) null else "Grant",
+                onAction = {
+                    context.startActivity(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS))
+                }
+            )
+            Spacer(Modifier.height(8.dp))
+            SetupTaskRow(
+                title = "Display over other apps",
+                subtitle = "Show the face-unlock screen on top",
+                done = overlayGranted,
+                actionLabel = if (overlayGranted) null else "Grant",
+                onAction = {
+                    context.startActivity(
+                        Intent(
+                            Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                            Uri.parse("package:${context.packageName}")
+                        )
+                    )
+                }
+            )
+
+            Spacer(Modifier.height(32.dp))
+            Button(
+                onClick = onFinish,
+                modifier = Modifier.fillMaxWidth().height(52.dp),
+                shape = RoundedCornerShape(16.dp)
+            ) {
+                Text(if (allDone) "Get Started" else "Skip for now")
+            }
+            Spacer(Modifier.height(8.dp))
+            Text(
+                "You can revisit setup later in the Settings tab.",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.outline,
+                textAlign = TextAlign.Center,
+                modifier = Modifier.fillMaxWidth()
+            )
+        }
+    }
+}
+
+@Composable
+private fun SetupTaskRow(
+    title: String,
+    subtitle: String,
+    done: Boolean,
+    actionLabel: String?,
+    onAction: () -> Unit
+) {
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(16.dp),
+        color = if (done)
+            MaterialTheme.colorScheme.secondaryContainer
+        else
+            MaterialTheme.colorScheme.surfaceContainer,
+        onClick = if (done) ({}) else onAction
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(14.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Icon(
+                if (done) Icons.Default.CheckCircle else Icons.Default.Warning,
+                contentDescription = null,
+                tint = if (done) Color(0xFF4CAF50) else MaterialTheme.colorScheme.outline
+            )
+            Spacer(Modifier.width(12.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                Text(title, fontWeight = FontWeight.SemiBold)
+                Text(
+                    subtitle,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.outline
+                )
+            }
+            if (!done && actionLabel != null) {
+                Text(
+                    actionLabel,
+                    color = MaterialTheme.colorScheme.primary,
+                    fontWeight = FontWeight.Bold,
+                    style = MaterialTheme.typography.labelLarge
+                )
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Global status banner. Single-line, pinned to the top of every tab. Answers
+// the user's first question: "is this thing working?" State priorities:
+//   1. setup incomplete  (no face OR critical perms missing)  → ERROR colour
+//   2. Free Play active                                        → PRIMARY colour
+//   3. shield ON with apps protected                           → SECONDARY
+//   4. shield ready but no apps protected yet                  → TERTIARY (nudge)
+// ============================================================================
+@Composable
+private fun StatusBanner(viewModel: MainViewModel) {
+    val context = LocalContext.current
+    val faceEmbedding by viewModel.faceEmbedding.collectAsState(initial = null)
+    val protectedApps by viewModel.protectedApps.collectAsState(initial = emptySet())
+    val endAt by viewModel.kidSessionEndAt.collectAsState(initial = 0L)
+    var nowMs by remember { mutableLongStateOf(System.currentTimeMillis()) }
+    val isFreePlay = nowMs < endAt
+
+    LaunchedEffect(endAt) {
+        while (System.currentTimeMillis() < endAt) {
+            nowMs = System.currentTimeMillis()
+            delay(1000L)
+        }
+        nowMs = System.currentTimeMillis()
+    }
+
+    var usageGranted by remember { mutableStateOf(isUsageStatsPermissionGranted(context)) }
+    var overlayGranted by remember { mutableStateOf(Settings.canDrawOverlays(context)) }
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val obs = androidx.lifecycle.LifecycleEventObserver { _, e ->
+            if (e == androidx.lifecycle.Lifecycle.Event.ON_RESUME) {
+                usageGranted = isUsageStatsPermissionGranted(context)
+                overlayGranted = Settings.canDrawOverlays(context)
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(obs)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(obs) }
+    }
+
+    val faceEnrolled = faceEmbedding != null
+    val criticalPermsOk = usageGranted && overlayGranted
+    val setupComplete = faceEnrolled && criticalPermsOk
+
+    val icon: ImageVector
+    val label: String
+    val container: Color
+    val onContainer: Color
+    when {
+        !setupComplete -> {
+            icon = Icons.Default.Warning
+            label = when {
+                !faceEnrolled -> "Setup incomplete — enrol your face"
+                !usageGranted -> "Setup incomplete — grant Usage Access"
+                !overlayGranted -> "Setup incomplete — grant Overlay permission"
+                else -> "Setup incomplete"
+            }
+            container = MaterialTheme.colorScheme.errorContainer
+            onContainer = MaterialTheme.colorScheme.onErrorContainer
+        }
+        isFreePlay -> {
+            val rem = (endAt - nowMs).coerceAtLeast(0L)
+            val mn = rem / 60_000L
+            val sc = (rem % 60_000L) / 1000L
+            icon = Icons.Default.PlayArrow
+            label = "Free Play active · %d:%02d remaining".format(mn, sc)
+            container = MaterialTheme.colorScheme.primaryContainer
+            onContainer = MaterialTheme.colorScheme.onPrimaryContainer
+        }
+        protectedApps.isEmpty() -> {
+            icon = Icons.Default.Info
+            label = "Shield ready — protect an app below"
+            container = MaterialTheme.colorScheme.tertiaryContainer
+            onContainer = MaterialTheme.colorScheme.onTertiaryContainer
+        }
+        else -> {
+            icon = Icons.Default.CheckCircle
+            label = "Shield ON · ${protectedApps.size} app${if (protectedApps.size == 1) "" else "s"} protected"
+            container = MaterialTheme.colorScheme.secondaryContainer
+            onContainer = MaterialTheme.colorScheme.onSecondaryContainer
+        }
+    }
+
+    Surface(
+        color = container,
+        modifier = Modifier
+            .fillMaxWidth()
+            .semantics {
+                liveRegion = LiveRegionMode.Polite
+                contentDescription = label
+            }
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 20.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Icon(icon, contentDescription = null, tint = onContainer, modifier = Modifier.size(18.dp))
+            Spacer(Modifier.width(8.dp))
+            Text(
+                label,
+                style = MaterialTheme.typography.labelLarge,
+                color = onContainer,
+                fontWeight = FontWeight.SemiBold,
+                modifier = Modifier.weight(1f)
+            )
         }
     }
 }
@@ -300,7 +726,7 @@ private fun SettingsList(viewModel: MainViewModel, onKidModeClick: () -> Unit) {
         Card(
             modifier = Modifier.fillMaxWidth().padding(vertical = 12.dp),
             shape = RoundedCornerShape(24.dp),
-            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f))
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer)
         ) {
             Column(modifier = Modifier.padding(8.dp)) {
                 StyleOption("Hardware Fault", "Simulate a broken module", lockMessageType == 0, Icons.Default.Warning) { viewModel.setLockMessageType(0) }
@@ -313,7 +739,65 @@ private fun SettingsList(viewModel: MainViewModel, onKidModeClick: () -> Unit) {
         TamperProtectionSection(viewModel)
 
         Spacer(Modifier.height(24.dp))
+        HelpOnboardingSection(viewModel)
+
+        Spacer(Modifier.height(24.dp))
         PermissionDashboard()
+    }
+}
+
+@Composable
+private fun HelpOnboardingSection(viewModel: MainViewModel) {
+    val coachMarks = com.shantanu.shield.ui.LocalCoachMarks.current
+    val requestTab = com.shantanu.shield.ui.LocalRequestTab.current
+    val snackbar = LocalSnackbarHostState.current
+    val scope = rememberCoroutineScope()
+
+    Text("Help & Onboarding", style = MaterialTheme.typography.titleLarge, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
+    Spacer(Modifier.height(12.dp))
+
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(20.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer)
+    ) {
+        Column {
+            Surface(
+                onClick = {
+                    if (coachMarks == null) return@Surface
+                    viewModel.replayTour(com.shantanu.shield.ui.CoachTours.FIRST_RUN_ID)
+                    requestTab?.invoke(1)
+                    scope.launch {
+                        // Give the Protect tab a moment to compose so coach-mark targets
+                        // are positioned before the tour reads their bounds.
+                        kotlinx.coroutines.delay(400)
+                        coachMarks.start(
+                            com.shantanu.shield.ui.CoachTours.FIRST_RUN_ID,
+                            com.shantanu.shield.ui.CoachTours.FIRST_RUN
+                        )
+                    }
+                },
+                color = MaterialTheme.colorScheme.surfaceContainer
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(16.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Icon(Icons.Default.PlayArrow, contentDescription = null, modifier = Modifier.size(28.dp))
+                    Spacer(Modifier.width(16.dp))
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("Replay welcome tour", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                        Spacer(Modifier.height(4.dp))
+                        Text(
+                            "Walk through the welcome tour again.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.outline
+                        )
+                    }
+                    Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = null)
+                }
+            }
+        }
     }
 }
 
@@ -326,9 +810,9 @@ private fun KidModeNavRow(viewModel: MainViewModel, onClick: () -> Unit) {
         shape = RoundedCornerShape(20.dp),
         colors = CardDefaults.cardColors(
             containerColor = if (isKidEnabled)
-                MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.5f)
+                MaterialTheme.colorScheme.primaryContainer
             else
-                MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f)
+                MaterialTheme.colorScheme.surfaceContainer
         )
     ) {
         Row(
@@ -363,23 +847,76 @@ private fun KidModeNavRow(viewModel: MainViewModel, onClick: () -> Unit) {
 private fun KidModeScreen(viewModel: MainViewModel, onBack: () -> Unit) {
     val ownerType by viewModel.ownerType.collectAsState(initial = "parent")
     val isKidEnabled = ownerType == "kid"
+    val lockOwnApp by viewModel.lockOwnApp.collectAsState(initial = false)
+    val faceEmbedding by viewModel.faceEmbedding.collectAsState(initial = null)
+    val snackbar = LocalSnackbarHostState.current
+    val scope = rememberCoroutineScope()
+    var showSelfLockDialog by remember { mutableStateOf(false) }
 
-    Column(modifier = Modifier.fillMaxSize()) {
-        Row(
-            modifier = Modifier.fillMaxWidth().padding(start = 4.dp, top = 8.dp, end = 16.dp, bottom = 8.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            IconButton(onClick = onBack) {
-                Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+    val requestTab = com.shantanu.shield.ui.LocalRequestTab.current
+    if (showSelfLockDialog) {
+        val faceEnrolled = faceEmbedding != null
+        AlertDialog(
+            onDismissRequest = { showSelfLockDialog = false },
+            shape = RoundedCornerShape(24.dp),
+            icon = {
+                Icon(
+                    Icons.Default.Lock,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.size(36.dp)
+                )
+            },
+            title = { Text("Protect Kids Shield itself?", fontWeight = FontWeight.Bold) },
+            text = {
+                val body = if (faceEnrolled) {
+                    "Kid Mode is now on. Lock Kids Shield behind Face ID so your kid can't open this app and disable budgets, allowed apps, or tamper protection."
+                } else {
+                    "Kid Mode is now on. To stop your kid from opening this app and disabling settings, we recommend locking Kids Shield behind Face ID. You'll need to enrol your face first."
+                }
+                Text(body, style = MaterialTheme.typography.bodyMedium)
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        showSelfLockDialog = false
+                        if (faceEnrolled) {
+                            viewModel.setLockOwnApp(true)
+                            scope.launch {
+                                snackbar.currentSnackbarData?.dismiss()
+                                snackbar.showSnackbar("Kids Shield now requires Face ID")
+                            }
+                        } else {
+                            requestTab?.invoke(0)
+                            scope.launch {
+                                snackbar.currentSnackbarData?.dismiss()
+                                snackbar.showSnackbar("Enrol your face, then enable Protect This App in Settings")
+                            }
+                        }
+                    },
+                    shape = RoundedCornerShape(14.dp)
+                ) { Text(if (faceEnrolled) "Lock it" else "Set up Face ID") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showSelfLockDialog = false }) { Text("Not now") }
             }
-            Spacer(Modifier.width(4.dp))
-            Text("Kid Mode", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
-        }
+        )
+    }
+
+    val topBarOverride = com.shantanu.shield.ui.LocalTopBarOverride.current
+    DisposableEffect(Unit) {
+        topBarOverride?.value = com.shantanu.shield.ui.TopBarOverride(
+            title = "Kid Mode",
+            onBack = onBack
+        )
+        onDispose { topBarOverride?.value = null }
+    }
+    Column(modifier = Modifier.fillMaxSize()) {
         Column(modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 20.dp, vertical = 8.dp)) {
             Card(
                 modifier = Modifier.fillMaxWidth(),
                 shape = RoundedCornerShape(20.dp),
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f))
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer)
             ) {
                 Row(
                     modifier = Modifier.fillMaxWidth().padding(16.dp),
@@ -397,7 +934,19 @@ private fun KidModeScreen(viewModel: MainViewModel, onBack: () -> Unit) {
                     Spacer(Modifier.width(12.dp))
                     Switch(
                         checked = isKidEnabled,
-                        onCheckedChange = { viewModel.setOwnerType(if (it) "kid" else "parent") }
+                        onCheckedChange = { on ->
+                            viewModel.setOwnerType(if (on) "kid" else "parent")
+                            scope.launch {
+                                snackbar.currentSnackbarData?.dismiss()
+                                snackbar.showSnackbar(
+                                    if (on) "Kid Mode enabled · daily budget active"
+                                    else "Kid Mode disabled"
+                                )
+                            }
+                            if (on && !lockOwnApp) {
+                                showSelfLockDialog = true
+                            }
+                        }
                     )
                 }
             }
@@ -417,6 +966,7 @@ fun TamperProtectionSection(viewModel: MainViewModel) {
     val lockOwnApp by viewModel.lockOwnApp.collectAsState(initial = false)
     val faceEmbedding by viewModel.faceEmbedding.collectAsState(initial = null)
     var adminActive by remember { mutableStateOf(TamperProtection.isAdminActive(context)) }
+    var expanded by remember { mutableStateOf(false) }
 
     val lifecycleOwner = LocalLifecycleOwner.current
     DisposableEffect(lifecycleOwner) {
@@ -429,42 +979,126 @@ fun TamperProtectionSection(viewModel: MainViewModel) {
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
+    val faceEnrolled = faceEmbedding != null
+    val activeCount = listOf(lockDeviceSettings, lockOwnApp && faceEnrolled, adminActive).count { it }
+    val maxCount = 3
+    val simpleAllOn = lockDeviceSettings && lockOwnApp && faceEnrolled
+
     Text("Tamper Protection", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+    Spacer(Modifier.height(8.dp))
+    Text(
+        "Stop a child from uninstalling the app or changing its settings.",
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.outline
+    )
     Spacer(Modifier.height(12.dp))
 
-    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        TamperCard(
-            title = "Lock System Settings",
-            description = "Require Face ID to open device Settings, so a child can't reach Force-Stop, app permissions, or uninstall screens.",
-            icon = Icons.Default.Settings,
-            checked = lockDeviceSettings,
-            onCheckedChange = { viewModel.setLockDeviceSettings(it) }
-        )
-        TamperCard(
-            title = "Protect This App",
-            description = if (faceEmbedding == null)
-                "Enroll your Face ID first, then enable this to require Face ID before Kids Shield opens."
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(20.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = if (activeCount == maxCount)
+                MaterialTheme.colorScheme.secondaryContainer
             else
-                "Require Face ID to open Kids Shield itself, so your protection settings can't be changed.",
-            icon = Icons.Default.Lock,
-            checked = lockOwnApp,
-            enabled = faceEmbedding != null,
-            onCheckedChange = { viewModel.setLockOwnApp(it) }
+                MaterialTheme.colorScheme.surfaceContainer
         )
-        TamperCard(
-            title = "Prevent Uninstall (Device Admin)",
-            description = "Register Kids Shield as a Device Administrator so it cannot be uninstalled. Turning this off here removes admin rights.",
-            icon = Icons.Default.Warning,
-            checked = adminActive,
-            onCheckedChange = { turnOn ->
-                if (turnOn) {
-                    context.startActivity(TamperProtection.enableAdminIntent(context))
-                } else {
-                    TamperProtection.disableAdmin(context)
-                    adminActive = false
-                }
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(16.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Box(
+                modifier = Modifier.size(44.dp).clip(CircleShape).background(
+                    if (activeCount == maxCount)
+                        Color(0xFF4CAF50).copy(alpha = 0.15f)
+                    else
+                        MaterialTheme.colorScheme.primary.copy(alpha = 0.1f)
+                ),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(
+                    if (activeCount == maxCount) Icons.Default.CheckCircle else Icons.Default.Lock,
+                    contentDescription = null,
+                    tint = if (activeCount == maxCount) Color(0xFF4CAF50) else MaterialTheme.colorScheme.primary
+                )
             }
+            Spacer(Modifier.width(16.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    when {
+                        activeCount == maxCount -> "Maximum protection"
+                        activeCount > 0 -> "Partial protection"
+                        else -> "Lock down everything"
+                    },
+                    fontWeight = FontWeight.Bold,
+                    style = MaterialTheme.typography.bodyLarge
+                )
+                Text(
+                    "$activeCount of $maxCount protections active",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.outline
+                )
+            }
+            Switch(
+                checked = simpleAllOn,
+                enabled = faceEnrolled,
+                onCheckedChange = { on ->
+                    viewModel.setLockDeviceSettings(on)
+                    if (faceEnrolled) viewModel.setLockOwnApp(on)
+                }
+            )
+        }
+    }
+
+    Spacer(Modifier.height(4.dp))
+    TextButton(onClick = { expanded = !expanded }) {
+        Text(
+            if (expanded) "Hide advanced" else "Show advanced",
+            color = MaterialTheme.colorScheme.primary,
+            fontWeight = FontWeight.SemiBold
         )
+        Icon(
+            if (expanded) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
+            contentDescription = null
+        )
+    }
+
+    if (expanded) {
+        Spacer(Modifier.height(8.dp))
+        Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            TamperCard(
+                title = "Lock System Settings",
+                description = "Require Face ID to open device Settings (Force-Stop, app permissions, uninstall).",
+                icon = Icons.Default.Settings,
+                checked = lockDeviceSettings,
+                onCheckedChange = { viewModel.setLockDeviceSettings(it) }
+            )
+            TamperCard(
+                title = "Protect This App",
+                description = if (!faceEnrolled)
+                    "Enrol your Face ID first."
+                else
+                    "Require Face ID to open Kids Shield itself.",
+                icon = Icons.Default.Lock,
+                checked = lockOwnApp,
+                enabled = faceEnrolled,
+                onCheckedChange = { viewModel.setLockOwnApp(it) }
+            )
+            TamperCard(
+                title = "Prevent Uninstall (Device Admin)",
+                description = "Register as Device Admin so the app can't be uninstalled.",
+                icon = Icons.Default.Warning,
+                checked = adminActive,
+                onCheckedChange = { turnOn ->
+                    if (turnOn) {
+                        context.startActivity(TamperProtection.enableAdminIntent(context))
+                    } else {
+                        TamperProtection.disableAdmin(context)
+                        adminActive = false
+                    }
+                }
+            )
+        }
     }
 }
 
@@ -480,7 +1114,7 @@ fun TamperCard(
     Card(
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(20.dp),
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f))
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer)
     ) {
         Row(modifier = Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
             Box(modifier = Modifier.size(44.dp).clip(CircleShape).background(MaterialTheme.colorScheme.secondaryContainer), contentAlignment = Alignment.Center) {
@@ -522,7 +1156,20 @@ fun StyleOption(title: String, subtitle: String, selected: Boolean, icon: ImageV
 @Composable
 fun UsageDashboardScreen(viewModel: MainViewModel) {
     val usageStats by viewModel.usageStats.collectAsState()
+    val context = LocalContext.current
     var selectedDay by remember { mutableIntStateOf(0) }
+    var usageGranted by remember { mutableStateOf(isUsageStatsPermissionGranted(context)) }
+
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val obs = androidx.lifecycle.LifecycleEventObserver { _, e ->
+            if (e == androidx.lifecycle.Lifecycle.Event.ON_RESUME) {
+                usageGranted = isUsageStatsPermissionGranted(context)
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(obs)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(obs) }
+    }
 
     Column(modifier = Modifier.fillMaxSize()) {
         ScrollableTabRow(
@@ -540,7 +1187,7 @@ fun UsageDashboardScreen(viewModel: MainViewModel) {
             listOf("Today", "Yesterday", "2 Days", "3 Days", "4 Days").forEachIndexed { index, label ->
                 Tab(
                     selected = selectedDay == index,
-                    onClick = { 
+                    onClick = {
                         selectedDay = index
                         viewModel.fetchUsageStats(index)
                     },
@@ -549,10 +1196,20 @@ fun UsageDashboardScreen(viewModel: MainViewModel) {
             }
         }
 
-        if (usageStats.isEmpty()) {
-            EmptyUsageState()
-        } else {
-            LazyColumn(
+        when {
+            !usageGranted -> EmptyUsageState(
+                icon = Icons.Default.Warning,
+                title = "Usage Access required",
+                body = "Grant Usage Access permission to see which apps were used and for how long.",
+                actionLabel = "Open Settings",
+                onAction = { context.startActivity(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS)) }
+            )
+            usageStats.isEmpty() -> EmptyUsageState(
+                icon = Icons.Default.Info,
+                title = "No usage recorded",
+                body = "No app activity tracked for this period yet."
+            )
+            else -> LazyColumn(
                 modifier = Modifier.fillMaxSize(),
                 contentPadding = PaddingValues(20.dp),
                 verticalArrangement = Arrangement.spacedBy(12.dp)
@@ -570,7 +1227,7 @@ fun UsageItem(stat: AppUsageInfo) {
     Card(
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(20.dp),
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f))
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer)
     ) {
         Row(modifier = Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
             Image(bitmap = stat.icon.toBitmap().asImageBitmap(), contentDescription = null, modifier = Modifier.size(48.dp).clip(RoundedCornerShape(12.dp)), contentScale = ContentScale.Crop)
@@ -584,12 +1241,34 @@ fun UsageItem(stat: AppUsageInfo) {
 }
 
 @Composable
-fun EmptyUsageState() {
-    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-            Icon(Icons.Default.Info, null, modifier = Modifier.size(64.dp), tint = MaterialTheme.colorScheme.outline)
+fun EmptyUsageState(
+    icon: ImageVector,
+    title: String,
+    body: String,
+    actionLabel: String? = null,
+    onAction: (() -> Unit)? = null
+) {
+    Box(modifier = Modifier.fillMaxSize().padding(24.dp), contentAlignment = Alignment.Center) {
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Icon(icon, null, modifier = Modifier.size(56.dp), tint = MaterialTheme.colorScheme.outline)
             Spacer(Modifier.height(16.dp))
-            Text("No usage data. Check permissions.", color = MaterialTheme.colorScheme.outline)
+            Text(title, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+            Spacer(Modifier.height(6.dp))
+            Text(
+                body,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.outline,
+                textAlign = TextAlign.Center
+            )
+            if (actionLabel != null && onAction != null) {
+                Spacer(Modifier.height(20.dp))
+                Button(onClick = onAction, shape = RoundedCornerShape(14.dp)) {
+                    Text(actionLabel)
+                }
+            }
         }
     }
 }
@@ -653,7 +1332,7 @@ fun PermissionDashboard() {
 fun ActionRow(title: String, subtitle: String, onClick: () -> Unit) {
     Surface(
         onClick = onClick,
-        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f),
+        color = MaterialTheme.colorScheme.surfaceContainer,
         shape = RoundedCornerShape(16.dp)
     ) {
         Row(modifier = Modifier.fillMaxWidth().padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -672,7 +1351,7 @@ fun ActionRow(title: String, subtitle: String, onClick: () -> Unit) {
 fun PermissionRow(title: String, isGranted: Boolean, onGrant: () -> Unit) {
     Surface(
         onClick = if (!isGranted) onGrant else ({}),
-        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f),
+        color = MaterialTheme.colorScheme.surfaceContainer,
         shape = RoundedCornerShape(16.dp)
     ) {
         Row(modifier = Modifier.fillMaxWidth().padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -690,6 +1369,8 @@ fun ProtectAppList(viewModel: MainViewModel) {
     val apps by viewModel.filteredApps.collectAsState()
     val protectedApps by viewModel.protectedApps.collectAsState(initial = emptySet())
     val searchQuery by viewModel.searchQuery.collectAsState()
+    val snackbar = LocalSnackbarHostState.current
+    val scope = rememberCoroutineScope()
 
     LazyColumn(
         modifier = Modifier.fillMaxSize().padding(horizontal = 20.dp),
@@ -697,7 +1378,7 @@ fun ProtectAppList(viewModel: MainViewModel) {
         contentPadding = PaddingValues(top = 20.dp, bottom = 120.dp)
     ) {
         item(key = "title") {
-            Column {
+            Column(modifier = Modifier.coachTarget("protect-item")) {
                 Text(
                     "Apps that need face unlock",
                     style = MaterialTheme.typography.titleLarge,
@@ -718,7 +1399,7 @@ fun ProtectAppList(viewModel: MainViewModel) {
                 modifier = Modifier.fillMaxWidth(),
                 shape = RoundedCornerShape(16.dp),
                 colors = CardDefaults.cardColors(
-                    containerColor = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.4f)
+                    containerColor = MaterialTheme.colorScheme.secondaryContainer
                 )
             ) {
                 Row(
@@ -728,7 +1409,7 @@ fun ProtectAppList(viewModel: MainViewModel) {
                     Icon(Icons.Default.Info, contentDescription = null, modifier = Modifier.size(20.dp))
                     Spacer(Modifier.width(10.dp))
                     Text(
-                        "If your kid has their own phone, activate Kid Mode under the Setup tab instead.",
+                        "If your kid has their own phone, activate Kid Mode under the Settings tab instead.",
                         style = MaterialTheme.typography.bodySmall,
                         modifier = Modifier.weight(1f)
                     )
@@ -752,8 +1433,8 @@ fun ProtectAppList(viewModel: MainViewModel) {
                 shape = RoundedCornerShape(24.dp),
                 singleLine = true,
                 colors = OutlinedTextFieldDefaults.colors(
-                    focusedContainerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f),
-                    unfocusedContainerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f),
+                    focusedContainerColor = MaterialTheme.colorScheme.surfaceContainer,
+                    unfocusedContainerColor = MaterialTheme.colorScheme.surfaceContainer,
                     focusedBorderColor = Color.Transparent,
                     unfocusedBorderColor = Color.Transparent
                 )
@@ -769,8 +1450,16 @@ fun ProtectAppList(viewModel: MainViewModel) {
             }
         } else {
             items(apps, key = { it.packageName }) { app ->
-                AppShieldItem(app, protectedApps.contains(app.packageName)) {
+                val wasProtected = protectedApps.contains(app.packageName)
+                AppShieldItem(app, wasProtected) {
                     viewModel.toggleAppProtection(app.packageName)
+                    scope.launch {
+                        snackbar.currentSnackbarData?.dismiss()
+                        snackbar.showSnackbar(
+                            if (wasProtected) "${app.name} no longer requires face unlock"
+                            else "${app.name} now requires face unlock"
+                        )
+                    }
                 }
             }
         }
@@ -794,11 +1483,50 @@ private fun EmptyStateMessage(text: String) {
 
 @Composable
 fun AppShieldItem(app: AppInfo, isProtected: Boolean, onToggle: () -> Unit) {
-    Surface(onClick = onToggle, shape = RoundedCornerShape(20.dp), color = if (isProtected) MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.4f) else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.2f)) {
+    Surface(
+        onClick = onToggle,
+        shape = RoundedCornerShape(20.dp),
+        color = if (isProtected)
+            MaterialTheme.colorScheme.primaryContainer
+        else
+            MaterialTheme.colorScheme.surfaceContainerLow
+    ) {
         Row(modifier = Modifier.fillMaxWidth().padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
-            Image(bitmap = app.icon.toBitmap().asImageBitmap(), contentDescription = null, modifier = Modifier.size(44.dp).clip(RoundedCornerShape(10.dp)))
+            Box(contentAlignment = Alignment.BottomEnd) {
+                Image(
+                    bitmap = app.icon.toBitmap().asImageBitmap(),
+                    contentDescription = null,
+                    modifier = Modifier.size(44.dp).clip(RoundedCornerShape(10.dp))
+                )
+                if (isProtected) {
+                    Box(
+                        modifier = Modifier
+                            .offset(x = 4.dp, y = 4.dp)
+                            .size(18.dp)
+                            .clip(CircleShape)
+                            .background(MaterialTheme.colorScheme.primary),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            Icons.Default.Lock,
+                            contentDescription = "Protected",
+                            modifier = Modifier.size(11.dp),
+                            tint = MaterialTheme.colorScheme.onPrimary
+                        )
+                    }
+                }
+            }
             Spacer(Modifier.width(16.dp))
-            Text(app.name, modifier = Modifier.weight(1f), fontWeight = FontWeight.SemiBold)
+            Column(modifier = Modifier.weight(1f)) {
+                Text(app.name, fontWeight = FontWeight.SemiBold)
+                if (isProtected) {
+                    Text(
+                        "Face unlock required",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                }
+            }
             Switch(checked = isProtected, onCheckedChange = { onToggle() })
         }
     }
@@ -817,6 +1545,8 @@ fun ProtectScreen(viewModel: MainViewModel) {
     var nowMs by remember { mutableLongStateOf(System.currentTimeMillis()) }
     val isFreePlayActive = nowMs < endAt
     var showDialog by remember { mutableStateOf(false) }
+    val snackbar = LocalSnackbarHostState.current
+    val scope = rememberCoroutineScope()
 
     LaunchedEffect(endAt) {
         while (System.currentTimeMillis() < endAt) {
@@ -826,26 +1556,34 @@ fun ProtectScreen(viewModel: MainViewModel) {
         nowMs = System.currentTimeMillis()
     }
 
-    Box(modifier = Modifier.fillMaxSize()) {
-        ProtectAppList(viewModel)
+    Column(modifier = Modifier.fillMaxSize()) {
+        Box(modifier = Modifier.fillMaxWidth().coachTarget("status-banner")) {
+            StatusBanner(viewModel)
+        }
+        Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
+            ProtectAppList(viewModel)
 
-        if (isFreePlayActive) {
-            val remainingMs = (endAt - nowMs).coerceAtLeast(0L)
-            FreePlayActiveBanner(
-                remainingMs = remainingMs,
-                modifier = Modifier
-                    .align(Alignment.BottomCenter)
-                    .padding(horizontal = 20.dp, vertical = 16.dp)
-            )
-        } else {
-            ExtendedFloatingActionButton(
-                onClick = { showDialog = true },
-                modifier = Modifier
-                    .align(Alignment.BottomEnd)
-                    .padding(20.dp),
-                icon = { Icon(Icons.Default.PlayArrow, contentDescription = null) },
-                text = { Text("Free Play") }
-            )
+            if (isFreePlayActive) {
+                val remainingMs = (endAt - nowMs).coerceAtLeast(0L)
+                FreePlayActiveBanner(
+                    remainingMs = remainingMs,
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .padding(horizontal = 20.dp, vertical = 16.dp)
+                )
+            } else {
+                ExtendedFloatingActionButton(
+                    onClick = { showDialog = true },
+                    modifier = Modifier
+                        .align(Alignment.BottomEnd)
+                        .padding(20.dp)
+                        .coachTarget("free-play-fab"),
+                    containerColor = MaterialTheme.colorScheme.primary,
+                    contentColor = MaterialTheme.colorScheme.onPrimary,
+                    icon = { Icon(Icons.Default.PlayArrow, contentDescription = null) },
+                    text = { Text("Free Play", fontWeight = FontWeight.SemiBold) }
+                )
+            }
         }
     }
 
@@ -855,6 +1593,10 @@ fun ProtectScreen(viewModel: MainViewModel) {
             onConfirm = { minutes ->
                 viewModel.startKidSession(minutes)
                 showDialog = false
+                scope.launch {
+                    snackbar.currentSnackbarData?.dismiss()
+                    snackbar.showSnackbar("Free Play started · $minutes min")
+                }
             }
         )
     }
@@ -892,6 +1634,7 @@ private fun FreePlayActiveBanner(remainingMs: Long, modifier: Modifier = Modifie
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun FreePlayStartDialog(onDismiss: () -> Unit, onConfirm: (Int) -> Unit) {
     val presets = listOf(10, 20, 30, 60)
@@ -912,8 +1655,9 @@ private fun FreePlayStartDialog(onDismiss: () -> Unit, onConfirm: (Int) -> Unit)
                     color = MaterialTheme.colorScheme.outline
                 )
                 Spacer(Modifier.height(16.dp))
-                Row(
+                FlowRow(
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
                     modifier = Modifier.fillMaxWidth()
                 ) {
                     presets.forEach { min ->
@@ -986,7 +1730,7 @@ private fun KidProtectBody(viewModel: MainViewModel) {
             Card(
                 modifier = Modifier.fillMaxWidth(),
                 shape = RoundedCornerShape(20.dp),
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f))
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer)
             ) {
                 Column(modifier = Modifier.padding(16.dp)) {
                     Text(
@@ -1025,7 +1769,7 @@ private fun KidProtectBody(viewModel: MainViewModel) {
             Card(
                 modifier = Modifier.fillMaxWidth(),
                 shape = RoundedCornerShape(20.dp),
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f))
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer)
             ) {
                 Column(modifier = Modifier.padding(8.dp)) {
                     PresetOption(
@@ -1055,7 +1799,7 @@ private fun KidProtectBody(viewModel: MainViewModel) {
                 // are always unrestricted in Kid mode and are not shown in this list.
                 Surface(
                     shape = RoundedCornerShape(12.dp),
-                    color = MaterialTheme.colorScheme.tertiaryContainer.copy(alpha = 0.5f),
+                    color = MaterialTheme.colorScheme.tertiaryContainer,
                     modifier = Modifier.fillMaxWidth()
                 ) {
                     Row(
@@ -1103,52 +1847,68 @@ private fun KidProtectBody(viewModel: MainViewModel) {
                     singleLine = true,
                     shape = RoundedCornerShape(20.dp),
                     colors = OutlinedTextFieldDefaults.colors(
-                        focusedContainerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f),
-                        unfocusedContainerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f),
+                        focusedContainerColor = MaterialTheme.colorScheme.surfaceContainer,
+                        unfocusedContainerColor = MaterialTheme.colorScheme.surfaceContainer,
                         focusedBorderColor = Color.Transparent,
                         unfocusedBorderColor = Color.Transparent
                     )
                 )
 
                 Spacer(Modifier.height(8.dp))
-                // Filter by query, then sort with currently-allowed apps on top, then by name.
-                val visibleApps = remember(installedApps, customAllowed, pickerQuery) {
+                // Group apps by category for easier scanning. Searching collapses to flat
+                // results across all categories; empty categories are hidden.
+                val groupedForPicker = remember(installedApps, customAllowed, pickerQuery) {
                     val q = pickerQuery.trim()
-                    installedApps
-                        .let { list -> if (q.isEmpty()) list else list.filter { it.name.contains(q, ignoreCase = true) } }
-                        .sortedWith(
-                            compareByDescending<AppInfo> { customAllowed.contains(it.packageName) }
-                                .thenBy { it.name.lowercase() }
-                        )
+                    val filtered = if (q.isEmpty()) installedApps
+                        else installedApps.filter { it.name.contains(q, ignoreCase = true) }
+                    val sorted = filtered.sortedWith(
+                        compareByDescending<AppInfo> { customAllowed.contains(it.packageName) }
+                            .thenBy { it.name.lowercase() }
+                    )
+                    AppCategory.values()
+                        .sortedBy { it.order }
+                        .mapNotNull { cat ->
+                            val catApps = sorted.filter { it.category == cat }
+                            if (catApps.isEmpty()) null else cat to catApps
+                        }
                 }
+                val totalVisible = groupedForPicker.sumOf { it.second.size }
 
                 Card(
                     modifier = Modifier.fillMaxWidth(),
                     shape = RoundedCornerShape(20.dp),
-                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f))
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer)
                 ) {
-                    Column(modifier = Modifier.padding(8.dp)) {
-                        if (installedApps.isEmpty()) {
-                            Text(
+                    Column(modifier = Modifier.padding(horizontal = 8.dp, vertical = 8.dp)) {
+                        when {
+                            installedApps.isEmpty() -> Text(
                                 "Loading installed apps…",
                                 modifier = Modifier.padding(16.dp),
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.outline
                             )
-                        } else if (visibleApps.isEmpty()) {
-                            Text(
+                            totalVisible == 0 -> Text(
                                 "No apps match \"$pickerQuery\".",
                                 modifier = Modifier.padding(16.dp),
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.outline
                             )
-                        } else {
-                            visibleApps.forEach { app ->
-                                AllowedAppRow(
-                                    app = app,
-                                    isAllowed = customAllowed.contains(app.packageName),
-                                    onToggle = { viewModel.toggleCustomAlwaysAllowed(app.packageName) }
+                            else -> groupedForPicker.forEach { (category, apps) ->
+                                Text(
+                                    category.label,
+                                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                                    style = MaterialTheme.typography.labelLarge,
+                                    color = MaterialTheme.colorScheme.primary,
+                                    fontWeight = FontWeight.Bold
                                 )
+                                apps.forEach { app ->
+                                    AllowedAppRow(
+                                        app = app,
+                                        isAllowed = customAllowed.contains(app.packageName),
+                                        onToggle = { viewModel.toggleCustomAlwaysAllowed(app.packageName) }
+                                    )
+                                }
+                                Spacer(Modifier.height(6.dp))
                             }
                         }
                     }
@@ -1162,49 +1922,85 @@ private fun KidProtectBody(viewModel: MainViewModel) {
                 fontWeight = FontWeight.Bold
             )
             Spacer(Modifier.height(12.dp))
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(20.dp),
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f))
-            ) {
-                Column(modifier = Modifier.padding(16.dp)) {
-                    val usedMin = (usedMs / 60_000L).toInt()
-                    val extensionMin = (extensionsMs / 60_000L).toInt()
-                    val effectiveLimit = dailyLimitMinutes + extensionMin
-                    val progress = if (effectiveLimit > 0)
-                        (usedMin.toFloat() / effectiveLimit).coerceIn(0f, 1f) else 0f
-                    val remaining = (effectiveLimit - usedMin).coerceAtLeast(0)
-                    val overLimit = usedMin >= effectiveLimit
-                    Text(
-                        "$usedMin / $effectiveLimit min used",
-                        style = MaterialTheme.typography.headlineSmall,
-                        fontWeight = FontWeight.Bold,
-                        color = if (overLimit) MaterialTheme.colorScheme.error
-                                else MaterialTheme.colorScheme.primary
+            run {
+                val usedMin = (usedMs / 60_000L).toInt()
+                val extensionMin = (extensionsMs / 60_000L).toInt()
+                val effectiveLimit = dailyLimitMinutes + extensionMin
+                val progress = if (effectiveLimit > 0)
+                    (usedMin.toFloat() / effectiveLimit).coerceIn(0f, 1f) else 0f
+                val remaining = (effectiveLimit - usedMin).coerceAtLeast(0)
+                val overLimit = usedMin >= effectiveLimit
+                val overByMin = (usedMin - effectiveLimit).coerceAtLeast(0)
+
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(20.dp),
+                    colors = CardDefaults.cardColors(
+                        containerColor = if (overLimit)
+                            MaterialTheme.colorScheme.errorContainer
+                        else
+                            MaterialTheme.colorScheme.surfaceContainer
                     )
-                    Spacer(Modifier.height(8.dp))
-                    LinearProgressIndicator(
-                        progress = { progress },
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(8.dp)
-                            .clip(RoundedCornerShape(8.dp)),
-                        color = if (overLimit) MaterialTheme.colorScheme.error
-                                else MaterialTheme.colorScheme.primary
-                    )
-                    Spacer(Modifier.height(8.dp))
-                    Text(
-                        "$remaining min remaining" +
-                            if (extensionMin > 0) "  •  +$extensionMin min extensions" else "",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.outline
-                    )
-                    Spacer(Modifier.height(4.dp))
-                    Text(
-                        "Updates every minute. Resets at 07:00 each day.",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.outline
-                    )
+                ) {
+                    Column(modifier = Modifier.padding(16.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(
+                                "$usedMin / $effectiveLimit min used",
+                                style = MaterialTheme.typography.headlineSmall,
+                                fontWeight = FontWeight.Bold,
+                                color = if (overLimit) MaterialTheme.colorScheme.error
+                                        else MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.weight(1f)
+                            )
+                            if (overLimit) {
+                                Surface(
+                                    color = MaterialTheme.colorScheme.error,
+                                    shape = RoundedCornerShape(50)
+                                ) {
+                                    Text(
+                                        "Over budget",
+                                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onError,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                }
+                            }
+                        }
+                        Spacer(Modifier.height(8.dp))
+                        LinearProgressIndicator(
+                            progress = { progress },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(8.dp)
+                                .clip(RoundedCornerShape(8.dp)),
+                            color = if (overLimit) MaterialTheme.colorScheme.error
+                                    else MaterialTheme.colorScheme.primary,
+                            trackColor = if (overLimit)
+                                MaterialTheme.colorScheme.error.copy(alpha = 0.2f)
+                            else
+                                MaterialTheme.colorScheme.surfaceVariant
+                        )
+                        Spacer(Modifier.height(8.dp))
+                        Text(
+                            if (overLimit)
+                                "$overByMin min over the budget" +
+                                    (if (extensionMin > 0) "  •  +$extensionMin min extensions" else "")
+                            else
+                                "$remaining min remaining" +
+                                    (if (extensionMin > 0) "  •  +$extensionMin min extensions" else ""),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = if (overLimit) MaterialTheme.colorScheme.error
+                                    else MaterialTheme.colorScheme.outline,
+                            fontWeight = if (overLimit) FontWeight.SemiBold else FontWeight.Normal
+                        )
+                        Spacer(Modifier.height(4.dp))
+                        Text(
+                            "Updates every minute. Resets at 07:00 each day.",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.outline
+                        )
+                    }
                 }
             }
         Spacer(Modifier.height(24.dp))
@@ -1241,8 +2037,8 @@ private fun AllowedAppRow(app: AppInfo, isAllowed: Boolean, onToggle: () -> Unit
     Surface(
         onClick = onToggle,
         shape = RoundedCornerShape(14.dp),
-        color = if (isAllowed) MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.4f)
-                else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.2f),
+        color = if (isAllowed) MaterialTheme.colorScheme.primaryContainer
+                else MaterialTheme.colorScheme.surfaceContainerLow,
         modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)
     ) {
         Row(modifier = Modifier.fillMaxWidth().padding(12.dp), verticalAlignment = Alignment.CenterVertically) {

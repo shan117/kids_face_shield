@@ -152,6 +152,8 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
     companion object {
         const val NOTIFICATION_ID = 101
         const val CHANNEL_ID = "AppLockServiceChannel"
+        const val FREE_PLAY_NOTIFICATION_ID = 102
+        const val FREE_PLAY_CHANNEL_ID = "FreePlayChannel"
         const val ACTION_CHECK_PACKAGE = "ACTION_CHECK_PACKAGE"
         const val EXTRA_PACKAGE_NAME = "EXTRA_PACKAGE_NAME"
         const val ACTION_LOCK_RESULT = "ACTION_LOCK_RESULT"
@@ -175,9 +177,32 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
         startScreenTimePolling()
         // Keep the Free-Play cache in lock-step with DataStore so the lock decision
         // path can answer synchronously. Collector exits when the service does.
+        // Also: post Free-Play start/end notifications by watching for transitions,
+        // and schedule the "ended" notification via a coroutine timer.
         serviceScope.launch {
+            var firstEmission = true
+            var previousEndAt = 0L
+            var endJob: Job? = null
             dataStoreManager.kidSessionEndAt.collect { endAt ->
                 cachedKidSessionEndAtMs = endAt
+                val now = System.currentTimeMillis()
+                if (!firstEmission) {
+                    val wasActive = previousEndAt > now
+                    val isActive = endAt > now
+                    if (!wasActive && isActive) {
+                        val durationMin = ((endAt - now + 30_000L) / 60_000L).toInt().coerceAtLeast(1)
+                        postFreePlayStartedNotification(durationMin)
+                    }
+                }
+                endJob?.cancel()
+                if (endAt > now) {
+                    endJob = launch {
+                        delay((endAt - System.currentTimeMillis()).coerceAtLeast(0L))
+                        postFreePlayEndedNotification()
+                    }
+                }
+                previousEndAt = endAt
+                firstEmission = false
             }
         }
     }
@@ -739,8 +764,59 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
     }
 
     private fun createNotificationChannel() {
-        val channel = NotificationChannel(CHANNEL_ID, "Security", NotificationManager.IMPORTANCE_LOW)
-        getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+        val nm = getSystemService(NotificationManager::class.java)
+        nm.createNotificationChannel(
+            NotificationChannel(CHANNEL_ID, "Security", NotificationManager.IMPORTANCE_LOW)
+        )
+        nm.createNotificationChannel(
+            NotificationChannel(FREE_PLAY_CHANNEL_ID, "Free Play sessions", NotificationManager.IMPORTANCE_DEFAULT).apply {
+                description = "Notifies when a Free Play session starts or ends"
+            }
+        )
+    }
+
+    private fun postFreePlayStartedNotification(durationMin: Int) {
+        val openIntent = PendingIntent.getActivity(
+            this, 0,
+            Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        val notification = NotificationCompat.Builder(this, FREE_PLAY_CHANNEL_ID)
+            .setSmallIcon(android.R.drawable.ic_media_play)
+            .setContentTitle("Free Play started")
+            .setContentText("All apps unlocked for $durationMin min. Tap to view.")
+            .setContentIntent(openIntent)
+            .setAutoCancel(true)
+            .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+            .build()
+        try {
+            getSystemService(NotificationManager::class.java)
+                .notify(FREE_PLAY_NOTIFICATION_ID, notification)
+        } catch (e: SecurityException) {
+            Log.w("AppLock", "POST_NOTIFICATIONS not granted; skipping Free Play start notification")
+        }
+    }
+
+    private fun postFreePlayEndedNotification() {
+        val openIntent = PendingIntent.getActivity(
+            this, 0,
+            Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        val notification = NotificationCompat.Builder(this, FREE_PLAY_CHANNEL_ID)
+            .setSmallIcon(android.R.drawable.ic_lock_lock)
+            .setContentTitle("Free Play ended")
+            .setContentText("Face-unlock protection has resumed.")
+            .setContentIntent(openIntent)
+            .setAutoCancel(true)
+            .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+            .build()
+        try {
+            getSystemService(NotificationManager::class.java)
+                .notify(FREE_PLAY_NOTIFICATION_ID, notification)
+        } catch (e: SecurityException) {
+            Log.w("AppLock", "POST_NOTIFICATIONS not granted; skipping Free Play end notification")
+        }
     }
 
     private fun loadLauncherPackages() {

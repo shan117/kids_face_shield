@@ -17,7 +17,8 @@ Legend: `[ ]` pending · `[~]` in progress · `[x]` done · `[!]` reverted/block
 | 4 | `UsageStatsManager` polling, 07:00 reset logic, today's-usage card | `[x]` | Build SUCCESSFUL. Service polls every 60s; card shows live used/limit + progress bar. |
 | 5 | Enforcement in `AppLockForegroundService` (day window + night window + budget) | `[x]` | Build SUCCESSFUL. `shouldLockForKidMode` wired into both `handlePackageChange` and `runWatchdog`. |
 | 6 | Dedicated kid-mode lock message (no extension buttons, per user decision) | `[x]` | `KidModeLockView` shown when kid-mode lock fires: "Your daily usage limit is over. Please engage yourself in other activities. More screen time can harm your eyes, brain, and reduce your concentration power." |
-| 7 *(later)* | Dashboard tab — 7-day usage + extension history | `[ ]` | Deferred |
+| 7 | Stats / Dashboard tab — owner-driven Parent vs Kid views, 7-day chart, top apps, weekly trends, monthly average | `[x]` | Build SUCCESSFUL. Stats tab live with donut + sparkbars + Trends (4-week bars + ↓/↑/→ pill + monthly avg). Switcher restored as disabled segmented row with Lock icon. |
+| 8 | Cross-cutting polish + hardening (tab reorder, unified header, face-doesn't-match UX, coach-mark layout, Auto-Backup disable, brand palette + Roboto typography) | `[x]` | Build SUCCESSFUL. Consistent visuals + biometric-safe storage across all Android devices. |
 
 ---
 
@@ -158,7 +159,120 @@ fields yet. Safe to ship even if Phase 2 is delayed.
   `AppLockForegroundService.kt` (thread `isKidModeLock` through
   `enforceLock` → `launchLockActivity`).
 - Build: SUCCESSFUL.
-### Phase 7 — _not started_
+### Phase 7 — _done_  (Stats / Dashboard)
+- **`StatsRepository`** (`ui/stats/StatsRepository.kt`):
+  - `dailyUsage(days)` — `UsageStatsManager` per-day buckets, controlled apps only
+    (Allowed-set + self + non-updated system apps excluded — same predicate as
+    Phase 4/5 enforcement, so chart and lock decisions agree byte-for-byte).
+  - `topAppsToday()` / `topAppsForRange(days)` — top-N controlled apps with
+    `pm.getApplicationLabel` resolution + cached app icon.
+  - `weeklyDailyAverages(weeks)` — last N rolling 7-day-window averages, used
+    by the Trends section.
+  - `monthToDateAverageMs()` — current calendar-month-to-date daily average.
+  - `freePlaySessionsToday()` — joins Free-Play history with today's window.
+  - `classifyDailyAverage(ms)` — low/normal/high color buckets driven by the
+    kid's `dailyLimitMinutes`. Used to tint FourWeekBars and TrendPill.
+- **`StatsViewModel`** (`ui/stats/StatsViewModel.kt`):
+  - Observes `ownerType` and auto-switches `viewMode` (Parent ↔ Kid) so the
+    dashboard always defaults to the device's owner type.
+  - Exposes `parentDashboard` and `kidDashboard` `StateFlow`s (top apps, daily
+    series, weekly averages, MTD avg, trend delta %, FP sessions today).
+- **`StatsScreen`** (`ui/stats/StatsScreen.kt`):
+  - Top: `SingleChoiceSegmentedButtonRow` Parent / Kid. The non-current owner
+    button is **disabled** with the Lock icon (Material3 `SegmentedButton.icon`
+    slot) and `SegmentedButtonDefaults.colors(disabledInactive*)` styling so
+    "this view doesn't apply to me" reads at a glance.
+  - Parent view: today's controlled-app screen time, top-apps list, donut
+    breakdown, 7-day spark-bar.
+  - Kid view: budget ring, today's free-play minutes, top-apps list, 7-day
+    spark-bar, Free-Play sessions today.
+  - Both views: **`WeeklyTrendCard`** (FourWeekBars colored via
+    `classifyDailyAverage` + ↓/↑/→ `TrendPill` driven by `trendDeltaPct` +
+    monthly `DailyAverageLine`).
+- **`StatsComponents`** (`ui/stats/StatsComponents.kt`):
+  - `TrendInfoCallout(text)` — `secondaryContainer`-tinted card with Info icon
+    + medium-weight text. Reused as the "Use the app for 4-5 weeks to see a
+    meaningful trend" fallback inside `WeeklyTrendCard` + `TrendPill`.
+  - `FourWeekBars`, `TrendPill`, `DailyAverageLine`, `BudgetRing`, donut,
+    sparkbars, top-app row.
+- Build: SUCCESSFUL. Phase 7 ships the full Stats experience.
+
+### Phase 8 — _done_  (cross-cutting polish + hardening)
+**Tab reorder + default tab**
+- New order: **Face (0) · Protect (1) · Settings (2) · Stats (3)**. Default
+  `selectedTab = 1` (Protect) since that's the most common landing screen.
+- Coach-mark guard updated (`selectedTab == 1`), deep-link `requestTab.invoke()`
+  indices and `when (selectedTab) { … }` titles remapped.
+- File: `MainActivity.kt`.
+
+**Face-doesn't-match UX (`AppFaceGate`)**
+- New `AppFaceAuthStatus` enum: `SEARCHING` / `NO_MATCH`.
+- `failedAttempts` increments are throttled (≥ 900 ms between bumps) so a single
+  blurry frame doesn't spike the counter.
+- 2.5 s of no-face detection auto-reverts `NO_MATCH` → `SEARCHING`.
+- `NO_MATCH` renders a red `Icons.Default.Close`, `errorContainer` background,
+  title "Face didn't match" + attempt counter.
+- File: `MainActivity.kt`.
+
+**Coach-mark vertical anchoring**
+- Removed dynamic `Placement` enum and `computeCardPlacement()` — coach card
+  now pins consistently below the target via fixed weights
+  `Spacer(weight = 0.45f) → CoachCard → Spacer(weight = 0.30f)`.
+- File: `ui/CoachMarks.kt`.
+
+**Unified header — `KfsTopBar`**
+- New file: `ui/KfsTopBar.kt`.
+  - `KfsTopBar(title, onBack = null, actions = {})` uses
+    `CenterAlignedTopAppBar`, draws a 1 dp `outlineVariant` hairline divider
+    via `drawBehind`, no persistent action icon (contextual `actions` slot).
+  - `TopBarOverride(title, onBack)` data class + `LocalTopBarOverride`
+    `CompositionLocal<MutableState<TopBarOverride?>?>` so sub-screens can
+    publish their own title/back-arrow to the parent Scaffold via
+    `DisposableEffect`, guaranteeing exactly **one** header on screen.
+- `KidModeScreen` now registers its title via `LocalTopBarOverride` instead of
+  rendering its own inline back-arrow row — fixes the double-header bug seen
+  when nav-ing into Kid Mode from Settings.
+- Files: `ui/KfsTopBar.kt` (new), `MainActivity.kt`.
+
+**Auto-Backup disabled (biometric-safe storage)**
+- Bug: on Realme (D2D transfer) the previous install's DataStore was being
+  restored to a "fresh" install, so `faceEmbedding` came back non-null and
+  the welcome screen incorrectly ticked "Enrol your face" green on first run.
+- Manifest: `android:allowBackup="false"` + `tools:replace="android:allowBackup"`.
+- `res/xml/backup_rules.xml`: explicit `<exclude domain="file"
+  path="datastore/app_lock_settings.preferences_pb" />` + sharedpref exclude.
+- `res/xml/data_extraction_rules.xml`: same exclusions in **both**
+  `<cloud-backup>` and `<device-transfer>` channels.
+- Net effect: biometric template + lock-state never leave the device, and a
+  fresh install on any phone always starts with `faceEmbedding == null`.
+
+**Brand palette + Roboto typography (cross-device consistency)**
+- Problem: with `dynamicColor = true` (Material You) and no custom
+  `Typography`, the app picked up the OEM's wallpaper palette + system font —
+  green-tinted on Motorola, near-black-and-white on Realme, Color OS Sans on
+  Realme vs Roboto on Moto. Charts in particular looked "discolored" on Realme.
+- `ui/theme/Color.kt` rewritten: full M3 token brand palette (light + dark)
+  around `BrandPrimary = 0xFF006C7F` (deep teal), with full
+  primary/secondary/tertiary/error/background/surface/outline/surfaceContainer
+  variants for both modes.
+- `ui/theme/Theme.kt` rewritten:
+  - `LightColors` / `DarkColors` built via `lightColorScheme()` /
+    `darkColorScheme()` from the brand tokens.
+  - **Removed `dynamicColor` parameter entirely** — no more wallpaper-driven
+    palette.
+  - Passes `typography = AppTypography` to `MaterialTheme`.
+- `ui/theme/Typography.kt` (new):
+  - `GoogleFont.Provider` pointing at `com.google.android.gms.fonts`.
+  - `RobotoFamily` across `Normal` / `Medium` / `SemiBold` / `Bold` /
+    `ExtraBold` via `GoogleFont("Roboto")`.
+  - `AppTypography` maps every M3 text style (display/headline/title/body/label
+    × Large/Medium/Small) to `RobotoFamily`.
+- `res/values/font_certs.xml` (new): Google Play Services downloadable-font
+  certs (dev + prod arrays) so the device can verify the GMS Fonts provider.
+- Dependency: added `androidx-compose-ui-text-google-fonts` to
+  `libs.versions.toml` + `app/build.gradle.kts`.
+- Result: same teal primary, same Roboto, same chart colors on Realme,
+  Motorola, Pixel, Samsung — no more OEM-driven cosmetic drift.
 
 ---
 

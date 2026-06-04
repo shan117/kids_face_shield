@@ -45,6 +45,9 @@ class MainViewModel @Inject constructor(
     val screenTimeUsedMs = dataStoreManager.screenTimeUsedMs
     val extensionsTodayMs = dataStoreManager.extensionsTodayMs
     val kidSessionEndAt = dataStoreManager.kidSessionEndAt
+    val firstRunCompleted = dataStoreManager.firstRunCompleted
+    val coachMarksEnabled = dataStoreManager.coachMarksEnabled
+    val seenTours = dataStoreManager.seenTours
 
     val filteredApps: StateFlow<List<AppInfo>> = combine(_installedApps, _searchQuery, protectedApps) { apps, query, protected ->
         val list = if (query.isBlank()) apps else apps.filter { it.name.contains(query, ignoreCase = true) }
@@ -184,9 +187,28 @@ class MainViewModel @Inject constructor(
     // the timer fires — there is no early-end action.
     fun startKidSession(durationMinutes: Int) {
         viewModelScope.launch {
-            val endAt = System.currentTimeMillis() + durationMinutes.coerceIn(1, 240) * 60_000L
+            val grantedMs = durationMinutes.coerceIn(1, 240) * 60_000L
+            val now = System.currentTimeMillis()
+            val endAt = now + grantedMs
             dataStoreManager.setKidSessionEndAt(endAt)
+            dataStoreManager.appendFreePlayRecord(now, endAt, grantedMs)
         }
+    }
+
+    fun setFirstRunCompleted(value: Boolean) {
+        viewModelScope.launch { dataStoreManager.setFirstRunCompleted(value) }
+    }
+
+    fun setCoachMarksEnabled(value: Boolean) {
+        viewModelScope.launch { dataStoreManager.setCoachMarksEnabled(value) }
+    }
+
+    fun markTourSeen(tourId: String) {
+        viewModelScope.launch { dataStoreManager.markTourSeen(tourId) }
+    }
+
+    fun replayTour(tourId: String) {
+        viewModelScope.launch { dataStoreManager.resetSeenTours() }
     }
 }
 

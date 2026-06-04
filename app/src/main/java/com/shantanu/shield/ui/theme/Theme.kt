@@ -1,35 +1,81 @@
 package com.shantanu.shield.ui.theme
 
-import android.os.Build
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.darkColorScheme
-import androidx.compose.material3.dynamicDarkColorScheme
-import androidx.compose.material3.dynamicLightColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
-import androidx.compose.ui.platform.LocalContext
 
-private val DarkColorScheme = darkColorScheme()
-private val LightColorScheme = lightColorScheme()
+private val LightColors = lightColorScheme(
+    primary = BrandPrimary,
+    onPrimary = BrandOnPrimary,
+    primaryContainer = BrandPrimaryContainer,
+    onPrimaryContainer = BrandOnPrimaryContainer,
+    secondary = BrandSecondary,
+    onSecondary = BrandOnSecondary,
+    secondaryContainer = BrandSecondaryContainer,
+    onSecondaryContainer = BrandOnSecondaryContainer,
+    tertiary = BrandTertiary,
+    onTertiary = BrandOnTertiary,
+    tertiaryContainer = BrandTertiaryContainer,
+    onTertiaryContainer = BrandOnTertiaryContainer,
+    error = BrandError,
+    onError = BrandOnError,
+    errorContainer = BrandErrorContainer,
+    onErrorContainer = BrandOnErrorContainer,
+    background = BrandBackground,
+    onBackground = BrandOnBackground,
+    surface = BrandSurface,
+    onSurface = BrandOnSurface,
+    surfaceVariant = BrandSurfaceVariant,
+    onSurfaceVariant = BrandOnSurfaceVariant,
+    outline = BrandOutline,
+    outlineVariant = BrandOutlineVariant,
+    surfaceContainer = BrandSurfaceContainer,
+    surfaceContainerHigh = BrandSurfaceContainerHigh,
+    surfaceContainerHighest = BrandSurfaceContainerHighest
+)
+
+private val DarkColors = darkColorScheme(
+    primary = BrandPrimaryDark,
+    onPrimary = BrandOnPrimaryDark,
+    primaryContainer = BrandPrimaryContainerDark,
+    onPrimaryContainer = BrandOnPrimaryContainerDark,
+    secondary = BrandSecondaryDark,
+    onSecondary = BrandOnSecondaryDark,
+    secondaryContainer = BrandSecondaryContainerDark,
+    onSecondaryContainer = BrandOnSecondaryContainerDark,
+    tertiary = BrandTertiaryDark,
+    onTertiary = BrandOnTertiaryDark,
+    tertiaryContainer = BrandTertiaryContainerDark,
+    onTertiaryContainer = BrandOnTertiaryContainerDark,
+    error = BrandError,
+    onError = BrandOnError,
+    errorContainer = BrandErrorContainer,
+    onErrorContainer = BrandOnErrorContainer,
+    background = BrandBackgroundDark,
+    onBackground = BrandOnBackgroundDark,
+    surface = BrandSurfaceDark,
+    onSurface = BrandOnSurfaceDark,
+    surfaceVariant = BrandSurfaceVariantDark,
+    onSurfaceVariant = BrandOnSurfaceVariantDark,
+    outline = BrandOutlineDark,
+    outlineVariant = BrandOutlineVariantDark,
+    surfaceContainer = BrandSurfaceContainerDark,
+    surfaceContainerHigh = BrandSurfaceContainerHighDark,
+    surfaceContainerHighest = BrandSurfaceContainerHighestDark
+)
 
 @Composable
 fun AppShieldTheme(
     darkTheme: Boolean = isSystemInDarkTheme(),
-    dynamicColor: Boolean = true,
     content: @Composable () -> Unit
 ) {
-    val colorScheme = when {
-        dynamicColor && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S -> {
-            val context = LocalContext.current
-            if (darkTheme) dynamicDarkColorScheme(context) else dynamicLightColorScheme(context)
-        }
-        darkTheme -> DarkColorScheme
-        else -> LightColorScheme
-    }
+    val colorScheme = if (darkTheme) DarkColors else LightColors
 
     MaterialTheme(
         colorScheme = colorScheme,
+        typography = AppTypography,
         content = content
     )
 }
