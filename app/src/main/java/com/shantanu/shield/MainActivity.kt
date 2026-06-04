@@ -47,6 +47,7 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.contentDescription
@@ -313,6 +314,22 @@ fun MainScreen(viewModel: MainViewModel = hiltViewModel()) {
             coachMarks.start(
                 com.shantanu.shield.ui.CoachTours.FIRST_RUN_ID,
                 com.shantanu.shield.ui.CoachTours.FIRST_RUN
+            )
+        }
+    }
+
+    // First visit to the Settings tab → run the Settings walkthrough exactly once.
+    LaunchedEffect(firstRunCompleted, seenTours, selectedTab) {
+        if (firstRunCompleted == true &&
+            selectedTab == 2 &&
+            seenTours.contains(com.shantanu.shield.ui.CoachTours.FIRST_RUN_ID) &&
+            !seenTours.contains(com.shantanu.shield.ui.CoachTours.SETTINGS_ID) &&
+            !coachMarks.visible
+        ) {
+            kotlinx.coroutines.delay(600)
+            coachMarks.start(
+                com.shantanu.shield.ui.CoachTours.SETTINGS_ID,
+                com.shantanu.shield.ui.CoachTours.SETTINGS
             )
         }
     }
@@ -714,35 +731,77 @@ fun SettingsScreen(viewModel: MainViewModel) {
 @Composable
 private fun SettingsList(viewModel: MainViewModel, onKidModeClick: () -> Unit) {
     val lockMessageType by viewModel.lockMessageType.collectAsState(initial = 0)
+    val scrollState = rememberScrollState()
+    val coachMarks = com.shantanu.shield.ui.LocalCoachMarks.current
+    val density = LocalDensity.current
 
-    Column(modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp)) {
+    val tamperStepIds = remember {
+        setOf("settings-tamper", "tamper-lock-settings", "tamper-protect-app", "tamper-prevent-uninstall")
+    }
+    val currentStepId = coachMarks?.steps?.getOrNull(coachMarks.currentIndex)?.id
+    val isTamperStep = coachMarks?.activeTourId == com.shantanu.shield.ui.CoachTours.SETTINGS_ID &&
+        currentStepId in tamperStepIds
+
+    LaunchedEffect(coachMarks?.currentIndex, coachMarks?.activeTourId) {
+        if (coachMarks?.activeTourId != com.shantanu.shield.ui.CoachTours.SETTINGS_ID) return@LaunchedEffect
+        val step = coachMarks.steps.getOrNull(coachMarks.currentIndex) ?: return@LaunchedEffect
+        when {
+            step.id == "settings-security-foundation" -> {
+                scrollState.animateScrollTo(scrollState.maxValue)
+            }
+            step.id == "settings-kid-mode" || step.id == "settings-welcome" -> {
+                scrollState.animateScrollTo(0)
+            }
+            step.id in tamperStepIds -> {
+                // Wait for the expanded sub-cards to compose + lay out so the
+                // coach-target Rects are measured before we read them.
+                kotlinx.coroutines.delay(220)
+                val tid = step.targetId ?: return@LaunchedEffect
+                val targetTop = coachMarks.targets[tid]?.top ?: return@LaunchedEffect
+                val desiredTopPx = with(density) { 110.dp.toPx() }
+                val delta = (targetTop - desiredTopPx).toInt()
+                val newScroll = (scrollState.value + delta).coerceIn(0, scrollState.maxValue)
+                scrollState.animateScrollTo(newScroll)
+            }
+        }
+    }
+
+    Column(modifier = Modifier.fillMaxSize().verticalScroll(scrollState).padding(20.dp)) {
         Text("System Customization", style = MaterialTheme.typography.titleLarge, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
         Spacer(Modifier.height(16.dp))
 
-        KidModeNavRow(viewModel, onClick = onKidModeClick)
+        Box(modifier = Modifier.coachTarget("settings-kid-mode")) {
+            KidModeNavRow(viewModel, onClick = onKidModeClick)
+        }
         Spacer(Modifier.height(24.dp))
 
-        Text("Intruder Feedback Style", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.outline)
-        Card(
-            modifier = Modifier.fillMaxWidth().padding(vertical = 12.dp),
-            shape = RoundedCornerShape(24.dp),
-            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer)
-        ) {
-            Column(modifier = Modifier.padding(8.dp)) {
-                StyleOption("Hardware Fault", "Simulate a broken module", lockMessageType == 0, Icons.Default.Warning) { viewModel.setLockMessageType(0) }
-                StyleOption("Wellness Guide", "Polite eye health warning", lockMessageType == 1, Icons.Default.Favorite) { viewModel.setLockMessageType(1) }
-                StyleOption("Spiritual Guide", "Shri Premanand Ji's advice", lockMessageType == 2, Icons.Default.AccountCircle) { viewModel.setLockMessageType(2) }
+        Column(modifier = Modifier.coachTarget("settings-intruder-style")) {
+            Text("Intruder Feedback Style", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.outline)
+            Card(
+                modifier = Modifier.fillMaxWidth().padding(vertical = 12.dp),
+                shape = RoundedCornerShape(24.dp),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer)
+            ) {
+                Column(modifier = Modifier.padding(8.dp)) {
+                    StyleOption("Hardware Fault", "Simulate a broken module", lockMessageType == 0, Icons.Default.Warning) { viewModel.setLockMessageType(0) }
+                    StyleOption("Wellness Guide", "Polite eye health warning", lockMessageType == 1, Icons.Default.Favorite) { viewModel.setLockMessageType(1) }
+                    StyleOption("Spiritual Guide", "Shri Premanand Ji's advice", lockMessageType == 2, Icons.Default.AccountCircle) { viewModel.setLockMessageType(2) }
+                }
             }
         }
 
         Spacer(Modifier.height(24.dp))
-        TamperProtectionSection(viewModel)
+        Column(modifier = Modifier.coachTarget("settings-tamper")) {
+            TamperProtectionSection(viewModel, forceExpanded = isTamperStep)
+        }
 
         Spacer(Modifier.height(24.dp))
         HelpOnboardingSection(viewModel)
 
         Spacer(Modifier.height(24.dp))
-        PermissionDashboard()
+        Column(modifier = Modifier.coachTarget("settings-security-foundation")) {
+            PermissionDashboard()
+        }
     }
 }
 
@@ -790,6 +849,39 @@ private fun HelpOnboardingSection(viewModel: MainViewModel) {
                         Spacer(Modifier.height(4.dp))
                         Text(
                             "Walk through the welcome tour again.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.outline
+                        )
+                    }
+                    Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = null)
+                }
+            }
+            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+            Surface(
+                onClick = {
+                    if (coachMarks == null) return@Surface
+                    viewModel.replayTour(com.shantanu.shield.ui.CoachTours.SETTINGS_ID)
+                    scope.launch {
+                        kotlinx.coroutines.delay(300)
+                        coachMarks.start(
+                            com.shantanu.shield.ui.CoachTours.SETTINGS_ID,
+                            com.shantanu.shield.ui.CoachTours.SETTINGS
+                        )
+                    }
+                },
+                color = MaterialTheme.colorScheme.surfaceContainer
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(16.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Icon(Icons.Default.Settings, contentDescription = null, modifier = Modifier.size(28.dp))
+                    Spacer(Modifier.width(16.dp))
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("Replay Settings tour", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                        Spacer(Modifier.height(4.dp))
+                        Text(
+                            "Re-explain Kid Mode, Intruder Feedback, Tamper Protection, Security Foundation.",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.outline
                         )
@@ -960,13 +1052,14 @@ private fun KidModeScreen(viewModel: MainViewModel, onBack: () -> Unit) {
 }
 
 @Composable
-fun TamperProtectionSection(viewModel: MainViewModel) {
+fun TamperProtectionSection(viewModel: MainViewModel, forceExpanded: Boolean = false) {
     val context = LocalContext.current
     val lockDeviceSettings by viewModel.lockDeviceSettings.collectAsState(initial = false)
     val lockOwnApp by viewModel.lockOwnApp.collectAsState(initial = false)
     val faceEmbedding by viewModel.faceEmbedding.collectAsState(initial = null)
     var adminActive by remember { mutableStateOf(TamperProtection.isAdminActive(context)) }
-    var expanded by remember { mutableStateOf(false) }
+    var userExpanded by remember { mutableStateOf(false) }
+    val expanded = userExpanded || forceExpanded
 
     val lifecycleOwner = LocalLifecycleOwner.current
     DisposableEffect(lifecycleOwner) {
@@ -1051,7 +1144,7 @@ fun TamperProtectionSection(viewModel: MainViewModel) {
     }
 
     Spacer(Modifier.height(4.dp))
-    TextButton(onClick = { expanded = !expanded }) {
+    TextButton(onClick = { userExpanded = !userExpanded }) {
         Text(
             if (expanded) "Hide advanced" else "Show advanced",
             color = MaterialTheme.colorScheme.primary,
@@ -1066,38 +1159,44 @@ fun TamperProtectionSection(viewModel: MainViewModel) {
     if (expanded) {
         Spacer(Modifier.height(8.dp))
         Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            TamperCard(
-                title = "Lock System Settings",
-                description = "Require Face ID to open device Settings (Force-Stop, app permissions, uninstall).",
-                icon = Icons.Default.Settings,
-                checked = lockDeviceSettings,
-                onCheckedChange = { viewModel.setLockDeviceSettings(it) }
-            )
-            TamperCard(
-                title = "Protect This App",
-                description = if (!faceEnrolled)
-                    "Enrol your Face ID first."
-                else
-                    "Require Face ID to open Kids Shield itself.",
-                icon = Icons.Default.Lock,
-                checked = lockOwnApp,
-                enabled = faceEnrolled,
-                onCheckedChange = { viewModel.setLockOwnApp(it) }
-            )
-            TamperCard(
-                title = "Prevent Uninstall (Device Admin)",
-                description = "Register as Device Admin so the app can't be uninstalled.",
-                icon = Icons.Default.Warning,
-                checked = adminActive,
-                onCheckedChange = { turnOn ->
-                    if (turnOn) {
-                        context.startActivity(TamperProtection.enableAdminIntent(context))
-                    } else {
-                        TamperProtection.disableAdmin(context)
-                        adminActive = false
+            Box(modifier = Modifier.coachTarget("tamper-lock-settings")) {
+                TamperCard(
+                    title = "Lock System Settings",
+                    description = "Require Face ID to open device Settings (Force-Stop, app permissions, uninstall).",
+                    icon = Icons.Default.Settings,
+                    checked = lockDeviceSettings,
+                    onCheckedChange = { viewModel.setLockDeviceSettings(it) }
+                )
+            }
+            Box(modifier = Modifier.coachTarget("tamper-protect-app")) {
+                TamperCard(
+                    title = "Protect This App",
+                    description = if (!faceEnrolled)
+                        "Enrol your Face ID first."
+                    else
+                        "Require Face ID to open Kids Shield itself.",
+                    icon = Icons.Default.Lock,
+                    checked = lockOwnApp,
+                    enabled = faceEnrolled,
+                    onCheckedChange = { viewModel.setLockOwnApp(it) }
+                )
+            }
+            Box(modifier = Modifier.coachTarget("tamper-prevent-uninstall")) {
+                TamperCard(
+                    title = "Prevent Uninstall (Device Admin)",
+                    description = "Register as Device Admin so the app can't be uninstalled.",
+                    icon = Icons.Default.Warning,
+                    checked = adminActive,
+                    onCheckedChange = { turnOn ->
+                        if (turnOn) {
+                            context.startActivity(TamperProtection.enableAdminIntent(context))
+                        } else {
+                            TamperProtection.disableAdmin(context)
+                            adminActive = false
+                        }
                     }
-                }
-            )
+                )
+            }
         }
     }
 }

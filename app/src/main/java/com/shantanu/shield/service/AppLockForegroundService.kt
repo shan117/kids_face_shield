@@ -618,7 +618,13 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
     // so kid-mode goes through the same robust full-screen LockActivity the system Settings lock
     // uses. Back/Home from LockActivity sends the user Home and re-arms the lock on next entry.
     private fun enforceLock(packageName: String, eventTime: Long, forceActivity: Boolean = false, isKidModeLock: Boolean = false) {
-        if (settingsPackages.contains(packageName) || forceActivity) {
+        // If overlay permission was revoked (e.g., user cleared app data, or first-run
+        // before granting), fall back to the full-screen LockActivity path so we don't
+        // crash with BadTokenException when adding TYPE_APPLICATION_OVERLAY.
+        val mustUseActivity = settingsPackages.contains(packageName) ||
+            forceActivity ||
+            !Settings.canDrawOverlays(this)
+        if (mustUseActivity) {
             launchLockActivity(packageName, eventTime, isKidModeLock)
         } else {
             showOverlay(packageName, eventTime)
@@ -647,6 +653,14 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
     }
 
     private fun showOverlay(packageName: String, eventTime: Long = System.currentTimeMillis()) {
+        // Hard-stop if SYSTEM_ALERT_WINDOW was revoked at runtime. addView on type 2038
+        // without the permission throws BadTokenException and crashes the service.
+        // Fall back to the activity path so the user is still protected.
+        if (!Settings.canDrawOverlays(this)) {
+            Log.w("AppLock", "showOverlay: overlay permission missing, routing to LockActivity")
+            launchLockActivity(packageName, eventTime, isKidModeLock = false)
+            return
+        }
         // Skip only if an overlay is already up for this exact entry (same package and same event timestamp).
         // A newer event timestamp for the same package means the user re-entered → recreate the overlay.
         if (isLockActive && lockingPackage == packageName && eventTime <= lockingPackageEventTime) return
