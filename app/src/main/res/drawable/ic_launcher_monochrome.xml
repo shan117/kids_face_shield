@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Monochrome layer for Android 13+ themed icons. Single-colour silhouette (the system tints
+     it): lock outline + shackle + a simple face, so it stays legible as a one-colour mark. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="512"
+    android:viewportHeight="512">
+    <group
+        android:pivotX="256"
+        android:pivotY="256"
+        android:scaleX="0.9"
+        android:scaleY="0.9">
+        <!-- shackle -->
+        <path android:fillColor="#00000000" android:strokeColor="#FF000000" android:strokeWidth="26"
+            android:strokeLineCap="round"
+            android:pathData="M214,250 L214,222 Q214,184 256,184 Q298,184 298,222 L298,250" />
+        <!-- lock body outline -->
+        <path android:fillColor="#00000000" android:strokeColor="#FF000000" android:strokeWidth="18"
+            android:strokeLineJoin="round"
+            android:pathData="M230,250 L282,250 Q314,250 314,282 L314,344 Q314,376 282,376 L230,376 Q198,376 198,344 L198,282 Q198,250 230,250 Z" />
+        <!-- eyes -->
+        <path android:fillColor="#FF000000" android:pathData="M222,300 a12,12 0 1,0 24,0 a12,12 0 1,0 -24,0 Z" />
+        <path android:fillColor="#FF000000" android:pathData="M266,300 a12,12 0 1,0 24,0 a12,12 0 1,0 -24,0 Z" />
+        <!-- smile -->
+        <path android:fillColor="#00000000" android:strokeColor="#FF000000" android:strokeWidth="12"
+            android:strokeLineCap="round"
+            android:pathData="M232,332 Q256,358 280,332" />
+    </group>
+</vector>

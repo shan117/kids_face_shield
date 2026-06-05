@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-label="Face is the Key">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#15A2BA"/>
+      <stop offset="1" stop-color="#006072"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="112" fill="url(#bg)"/>
+  <path d="M256 112 L380 152 Q392 156 392 176 L392 250 Q392 332 256 414 Q120 332 120 250 L120 176 Q120 156 132 152 Z" fill="#FFF7EC"/>
+  <!-- keyhole that is also a child + a face (head + flared body) -->
+  <g fill="#06414E">
+    <circle cx="256" cy="228" r="34"/>
+    <path d="M232 256 Q228 304 220 340 H292 Q284 304 280 256 Z"/>
+  </g>
+  <!-- tiny eyes turn the keyhole-head into a face -->
+  <circle cx="244" cy="224" r="6.5" fill="#FFF7EC"/>
+  <circle cx="268" cy="224" r="6.5" fill="#FFF7EC"/>
+  <!-- scan brackets to read 'face recognition' -->
+  <g fill="none" stroke="#FFC24B" stroke-width="15" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M196 214 L196 188 L222 188"/>
+    <path d="M290 188 L316 188 L316 214"/>
+  </g>
+</svg>

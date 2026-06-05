@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-label="Care (Heart) Shield">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0A8298"/>
+      <stop offset="1" stop-color="#004E5D"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="112" fill="url(#bg)"/>
+  <path d="M256 112 L380 152 Q392 156 392 176 L392 250 Q392 332 256 414 Q120 332 120 250 L120 176 Q120 156 132 152 Z" fill="#FFFFFF"/>
+  <path d="M256 324 C256 324 174 280 174 230 C174 205 194 189 217 189 C236 189 249 202 256 215 C263 202 276 189 295 189 C318 189 338 205 338 230 C338 280 256 324 256 324 Z" fill="#015C6E"/>
+</svg>

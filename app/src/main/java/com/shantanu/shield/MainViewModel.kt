@@ -195,6 +195,16 @@ class MainViewModel @Inject constructor(
         }
     }
 
+    // Parent grants the kid extra screen time for today once the daily budget is hit.
+    // Additive only (no "reset to zero") so the day's total grant stays auditable. The
+    // enforcement check is `usedMin >= dailyLimit + extensionMin`, so this directly
+    // relaxes the lock for `minutes` more. Resets to 0 at the next 07:00 boundary.
+    fun grantExtension(minutes: Int) {
+        viewModelScope.launch {
+            dataStoreManager.addExtensionMinutes(minutes.coerceIn(1, 240))
+        }
+    }
+
     fun setFirstRunCompleted(value: Boolean) {
         viewModelScope.launch { dataStoreManager.setFirstRunCompleted(value) }
     }

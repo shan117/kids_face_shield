@@ -2102,12 +2102,63 @@ private fun KidProtectBody(viewModel: MainViewModel) {
                     }
                 }
             }
+        Spacer(Modifier.height(16.dp))
+        BudgetExtensionCard(
+            extensionMin = (extensionsMs / 60_000L).toInt(),
+            onGrant = { mins -> viewModel.grantExtension(mins) }
+        )
         Spacer(Modifier.height(24.dp))
         Text(
             "Kid Mode is active. Non-allowed apps require parent face auth when the daily limit is over or during 22:00-07:00. Lock screen shows a kid-specific message about screen-time impact on eyes, brain, and concentration.",
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.outline
         )
+    }
+}
+
+// Parent-only control to grant extra screen time once the daily budget is hit. The whole
+// Kid Mode tab sits behind the "Protect This App" face lock when Kid Mode is on, so these
+// buttons are already gated from the kid. Extensions are additive and reset at 07:00.
+@Composable
+private fun BudgetExtensionCard(extensionMin: Int, onGrant: (Int) -> Unit) {
+    val snackbar = LocalSnackbarHostState.current
+    val scope = rememberCoroutineScope()
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(20.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer)
+    ) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Text("Extend today's budget", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+            Spacer(Modifier.height(4.dp))
+            Text(
+                if (extensionMin > 0)
+                    "Granted +$extensionMin min extra today. Tap to add more. Resets at 07:00."
+                else
+                    "Add extra minutes for today when the daily limit runs out. Resets at 07:00.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.outline
+            )
+            Spacer(Modifier.height(12.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                listOf(15, 30, 60).forEach { mins ->
+                    FilledTonalButton(
+                        onClick = {
+                            onGrant(mins)
+                            scope.launch {
+                                snackbar.currentSnackbarData?.dismiss()
+                                snackbar.showSnackbar("Added +$mins min to today's budget")
+                            }
+                        },
+                        shape = RoundedCornerShape(14.dp),
+                        modifier = Modifier.weight(1f)
+                    ) { Text("+$mins") }
+                }
+            }
+        }
     }
 }
 

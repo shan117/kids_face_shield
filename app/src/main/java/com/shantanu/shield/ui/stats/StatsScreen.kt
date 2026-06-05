@@ -27,6 +27,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.SegmentedButton
 import androidx.compose.material3.SegmentedButtonDefaults
 import androidx.compose.material3.SingleChoiceSegmentedButtonRow
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Face
@@ -336,7 +337,29 @@ private fun KidDashboard(snap: StatsSnapshot) {
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                     Spacer(Modifier.height(12.dp))
-                    BudgetRing(usedMs = snap.budgetUsedMs, totalMs = snap.budgetMs)
+                    // Ring fills against the EFFECTIVE limit (budget + today's extension), so
+                    // "over" matches the actual lock threshold and the Kid Mode tab card. The
+                    // pill below names the extension that grew the denominator.
+                    BudgetRing(
+                        usedMs = snap.budgetUsedMs,
+                        totalMs = snap.budgetMs + snap.extensionsTodayMs
+                    )
+                    val extMin = (snap.extensionsTodayMs / 60_000L).toInt()
+                    if (extMin > 0) {
+                        Spacer(Modifier.height(12.dp))
+                        Surface(
+                            color = MaterialTheme.colorScheme.tertiaryContainer,
+                            shape = RoundedCornerShape(50)
+                        ) {
+                            Text(
+                                "Budget extended +$extMin min today",
+                                modifier = Modifier.padding(horizontal = 14.dp, vertical = 6.dp),
+                                style = MaterialTheme.typography.labelLarge,
+                                color = MaterialTheme.colorScheme.onTertiaryContainer,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                        }
+                    }
                 }
             }
         }

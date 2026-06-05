@@ -1,9 +1,7 @@
 package com.shantanu.shield.ui.stats
 
-import android.app.usage.UsageEvents
 import android.app.usage.UsageStatsManager
 import android.content.Context
-import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.graphics.drawable.Drawable
 import com.shantanu.shield.data.DataStoreManager
@@ -36,72 +34,67 @@ class StatsRepository @Inject constructor(
     private val usm: UsageStatsManager
         get() = context.getSystemService(Context.USAGE_STATS_SERVICE) as UsageStatsManager
 
-    /** Per-package foreground time within the given window, sorted desc by time. */
-    fun usageInWindow(startMs: Long, endMs: Long): List<AppUsageBucket> {
-        val events = usm.queryEvents(startMs, endMs)
-        val sessionStart = mutableMapOf<String, Long>()
-        val totals = mutableMapOf<String, Long>()
-        val ev = UsageEvents.Event()
-        while (events.hasNextEvent()) {
-            events.getNextEvent(ev)
-            val pkg = ev.packageName ?: continue
-            when (ev.eventType) {
-                UsageEvents.Event.ACTIVITY_RESUMED -> sessionStart[pkg] = ev.timeStamp
-                UsageEvents.Event.ACTIVITY_PAUSED, UsageEvents.Event.ACTIVITY_STOPPED -> {
-                    val start = sessionStart.remove(pkg) ?: continue
-                    val delta = (ev.timeStamp - start).coerceAtLeast(0L)
-                    totals[pkg] = (totals[pkg] ?: 0L) + delta
-                }
-            }
-        }
-        // Any unclosed sessions count up to the window end.
-        sessionStart.forEach { (pkg, start) ->
-            val delta = (endMs - start).coerceAtLeast(0L)
-            totals[pkg] = (totals[pkg] ?: 0L) + delta
-        }
-        return totals.entries
-            .filter { it.value > 0L }
-            .mapNotNull { (pkg, ms) -> buildBucket(pkg, ms) }
+    // Default app filter for all usage queries: the controlled set (kid budget basis).
+    // The parent view passes AllowedApps.isVisibleInParentStats instead.
+    private fun controlled(pkg: String): Boolean =
+        com.shantanu.shield.util.AllowedApps.isControlledPackage(context, pkg)
+
+    /** Per-package foreground time within the given window, sorted desc by time.
+     *  [include] decides which packages are counted — controlled apps (kid view) or
+     *  parent-visible apps (parent view). Measurement is shared with the Kid Mode budget
+     *  via UsageMeasure, so the charts and the budget ring count usage identically. */
+    fun usageInWindow(
+        startMs: Long,
+        endMs: Long,
+        include: (String) -> Boolean = { controlled(it) }
+    ): List<AppUsageBucket> {
+        return com.shantanu.shield.util.UsageMeasure.foregroundMsByPackage(usm, startMs, endMs)
+            .entries
+            .filter { it.value > 0L && include(it.key) }
+            .mapNotNull { (pkg, ms) -> resolveBucket(pkg, ms) }
             .sortedByDescending { it.foregroundMs }
     }
 
-    fun todayWindow(): Pair<Long, Long> {
-        val cal = Calendar.getInstance().apply {
-            set(Calendar.HOUR_OF_DAY, 0); set(Calendar.MINUTE, 0); set(Calendar.SECOND, 0); set(Calendar.MILLISECOND, 0)
-        }
-        val start = cal.timeInMillis
-        return start to System.currentTimeMillis()
-    }
+    // Budget-day windows are anchored at 07:00 — the same boundary the service uses to
+    // reset the budget — so the dashboard's "today", 7-day chart, and trends line up with
+    // the enforced budget instead of the calendar midnight. A budget-day labelled e.g.
+    // "Tue" runs Tue 07:00 → Wed 07:00; usage at 02:00 Wed still belongs to Tue.
+
+    fun todayWindow(): Pair<Long, Long> = dayWindow(0)
 
     fun dayWindow(daysAgo: Int): Pair<Long, Long> {
-        val cal = Calendar.getInstance().apply {
-            add(Calendar.DAY_OF_YEAR, -daysAgo)
-            set(Calendar.HOUR_OF_DAY, 0); set(Calendar.MINUTE, 0); set(Calendar.SECOND, 0); set(Calendar.MILLISECOND, 0)
-        }
+        val cal = Calendar.getInstance()
+        // Step back to the start (07:00) of the current budget-day.
+        if (cal.get(Calendar.HOUR_OF_DAY) < 7) cal.add(Calendar.DAY_OF_YEAR, -1)
+        cal.set(Calendar.HOUR_OF_DAY, 7); cal.set(Calendar.MINUTE, 0); cal.set(Calendar.SECOND, 0); cal.set(Calendar.MILLISECOND, 0)
+        // …then back [daysAgo] whole budget-days. DAY_OF_YEAR arithmetic is DST-safe.
+        cal.add(Calendar.DAY_OF_YEAR, -daysAgo)
         val start = cal.timeInMillis
-        val end = if (daysAgo == 0) System.currentTimeMillis() else start + 24L * 60 * 60 * 1000 - 1
+        val end = if (daysAgo == 0) System.currentTimeMillis()
+                  else (cal.clone() as Calendar).apply { add(Calendar.DAY_OF_YEAR, 1) }.timeInMillis
         return start to end
     }
 
-    fun usageToday(): List<AppUsageBucket> {
+    fun usageToday(include: (String) -> Boolean = { controlled(it) }): List<AppUsageBucket> {
         val (s, e) = todayWindow()
-        return usageInWindow(s, e)
+        return usageInWindow(s, e, include)
     }
 
-    fun totalMsToday(): Long = usageToday().sumOf { it.foregroundMs }
+    fun totalMsToday(include: (String) -> Boolean = { controlled(it) }): Long =
+        usageToday(include).sumOf { it.foregroundMs }
 
-    fun totalMsForDay(daysAgo: Int): Long {
+    fun totalMsForDay(daysAgo: Int, include: (String) -> Boolean = { controlled(it) }): Long {
         val (s, e) = dayWindow(daysAgo)
-        return usageInWindow(s, e).sumOf { it.foregroundMs }
+        return usageInWindow(s, e, include).sumOf { it.foregroundMs }
     }
 
-    /** Last [days] days, oldest first; index 0 = today. */
-    suspend fun dailyTotals(days: Int): List<DayBucket> {
+    /** Last [days] budget-days, oldest first; index 0 = today. */
+    suspend fun dailyTotals(days: Int, include: (String) -> Boolean = { controlled(it) }): List<DayBucket> {
         val history = dataStoreManager.freePlayHistory.first()
         val out = ArrayList<DayBucket>(days)
         for (i in (days - 1) downTo 0) {
             val (s, e) = dayWindow(i)
-            val total = totalMsForWindow(s, e)
+            val total = totalMsForWindow(s, e, include)
             val fp = freePlayMsInWindow(history, s, e)
             out.add(DayBucket(s, total, fp))
         }
@@ -109,7 +102,7 @@ class StatsRepository @Inject constructor(
     }
 
     /** Daily averages for the last [weeks] weeks. Oldest first. */
-    fun weeklyDailyAverages(weeks: Int = 4): List<Long> {
+    fun weeklyDailyAverages(weeks: Int = 4, include: (String) -> Boolean = { controlled(it) }): List<Long> {
         if (weeks <= 0) return emptyList()
         val out = ArrayList<Long>(weeks)
         for (w in (weeks - 1) downTo 0) {
@@ -117,37 +110,39 @@ class StatsRepository @Inject constructor(
             for (d in 0 until 7) {
                 val daysAgo = w * 7 + d
                 val (s, e) = dayWindow(daysAgo)
-                weekTotal += totalMsForWindow(s, e)
+                weekTotal += totalMsForWindow(s, e, include)
             }
             out.add(weekTotal / 7)
         }
         return out
     }
 
-    /** Average daily screen time across the current calendar month so far. */
-    fun monthToDateAverageMs(): Long {
-        val now = Calendar.getInstance()
-        val monthStart = (now.clone() as Calendar).apply {
+    /** Average daily screen time across the budget-days of the current calendar month. */
+    fun monthToDateAverageMs(include: (String) -> Boolean = { controlled(it) }): Long {
+        val monthStartMs = (Calendar.getInstance().clone() as Calendar).apply {
             set(Calendar.DAY_OF_MONTH, 1)
             set(Calendar.HOUR_OF_DAY, 0); set(Calendar.MINUTE, 0); set(Calendar.SECOND, 0); set(Calendar.MILLISECOND, 0)
+        }.timeInMillis
+        var total = 0L
+        var days = 0
+        var daysAgo = 0
+        // Walk back budget-days while their start is still inside this calendar month.
+        while (daysAgo <= 31) {
+            val (s, e) = dayWindow(daysAgo)
+            if (s < monthStartMs) break
+            total += totalMsForWindow(s, e, include)
+            days++
+            daysAgo++
         }
-        val dayOfMonth = now.get(Calendar.DAY_OF_MONTH)
-        var monthTotal = 0L
-        for (d in 0 until dayOfMonth) {
-            val cal = (monthStart.clone() as Calendar).apply { add(Calendar.DAY_OF_MONTH, d) }
-            val start = cal.timeInMillis
-            val end = if (d == dayOfMonth - 1) System.currentTimeMillis() else start + 24L * 60 * 60 * 1000 - 1
-            monthTotal += totalMsForWindow(start, end)
-        }
-        return if (dayOfMonth == 0) 0L else monthTotal / dayOfMonth
+        return if (days == 0) 0L else total / days
     }
 
-    private fun totalMsForWindow(s: Long, e: Long): Long {
+    private fun totalMsForWindow(s: Long, e: Long, include: (String) -> Boolean = { controlled(it) }): Long {
         // queryUsageStats's totalTimeInForeground is unreliable for week-level rollups
         // (it returns cumulative values that can span beyond the bucket). Falling back
         // to event-based aggregation keeps numbers honest at the cost of a few extra
         // event scans per refresh.
-        return usageInWindow(s, e).sumOf { it.foregroundMs }
+        return usageInWindow(s, e, include).sumOf { it.foregroundMs }
     }
 
     suspend fun freePlayRecords(): List<FreePlayRecord> = dataStoreManager.freePlayHistory.first()
@@ -165,7 +160,7 @@ class StatsRepository @Inject constructor(
         }
 
     /** Per-app foreground time during any Free Play window today. */
-    suspend fun freePlayUsageToday(): List<AppUsageBucket> {
+    suspend fun freePlayUsageToday(include: (String) -> Boolean = { controlled(it) }): List<AppUsageBucket> {
         val (todayStart, todayEnd) = todayWindow()
         val sessions = freePlayRecordsToday()
         if (sessions.isEmpty()) return emptyList()
@@ -174,26 +169,22 @@ class StatsRepository @Inject constructor(
             val s = maxOf(session.startMs, todayStart)
             val e = minOf(session.endMs, todayEnd)
             if (e <= s) continue
-            for (bucket in usageInWindow(s, e)) {
+            for (bucket in usageInWindow(s, e, include)) {
                 merged[bucket.packageName] = (merged[bucket.packageName] ?: 0L) + bucket.foregroundMs
             }
         }
         return merged.entries
             .filter { it.value > 0L }
-            .mapNotNull { (pkg, ms) -> buildBucket(pkg, ms) }
+            .mapNotNull { (pkg, ms) -> resolveBucket(pkg, ms) }
             .sortedByDescending { it.foregroundMs }
     }
 
-    private fun buildBucket(pkg: String, ms: Long): AppUsageBucket? {
-        // Hide the launcher, our own app, and pure system apps the user never
-        // installed. Updated-system apps (Chrome, Maps, etc.) are kept because they
-        // behave like normal user apps from the parent's perspective.
-        if (pkg == context.packageName) return null
+    // Resolve a package's label + icon into a bucket. App-set filtering happens at the
+    // call site (via the `include` predicate), so this only returns null when the package
+    // can't be resolved (uninstalled since the usage event was recorded).
+    private fun resolveBucket(pkg: String, ms: Long): AppUsageBucket? {
         return try {
             val info = pm.getApplicationInfo(pkg, 0)
-            val isSystem = (info.flags and ApplicationInfo.FLAG_SYSTEM) != 0
-            val isUpdatedSystem = (info.flags and ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) != 0
-            if (isSystem && !isUpdatedSystem) return null
             AppUsageBucket(
                 packageName = pkg,
                 name = pm.getApplicationLabel(info).toString(),

@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-label="Lock Buddy in camera focus">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#15A2BA"/>
+      <stop offset="1" stop-color="#006072"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="112" fill="url(#bg)"/>
+  <!-- autofocus reticle = camera locking on the face -->
+  <circle cx="256" cy="286" r="150" fill="none" stroke="#FFF7EC" stroke-width="8" opacity="0.9"/>
+  <g stroke="#FFF7EC" stroke-width="8" stroke-linecap="round">
+    <path d="M256 118 V150"/>
+    <path d="M256 422 V454"/>
+    <path d="M88 286 H120"/>
+    <path d="M392 286 H424"/>
+  </g>
+  <!-- shackle + kid hair tuft -->
+  <path d="M214 252 V224 Q214 188 256 188 Q298 188 298 224 V252" fill="none" stroke="#FFF7EC" stroke-width="25" stroke-linecap="round"/>
+  <path d="M250 186 C246 162 285 160 279 183" fill="none" stroke="#FFC24B" stroke-width="13" stroke-linecap="round"/>
+  <!-- lock body / happy face -->
+  <rect x="200" y="252" width="112" height="122" rx="30" fill="#FFF7EC"/>
+  <circle cx="234" cy="300" r="13" fill="#06414E"/>
+  <circle cx="278" cy="300" r="13" fill="#06414E"/>
+  <circle cx="229" cy="295" r="4.5" fill="#FFFFFF"/>
+  <circle cx="273" cy="295" r="4.5" fill="#FFFFFF"/>
+  <ellipse cx="212" cy="321" rx="14" ry="9" fill="#FF9E7A" opacity="0.85"/>
+  <ellipse cx="300" cy="321" rx="14" ry="9" fill="#FF9E7A" opacity="0.85"/>
+  <path d="M230 330 Q256 362 282 330 Q256 346 230 330 Z" fill="#06414E"/>
+  <ellipse cx="256" cy="342" rx="9" ry="5" fill="#FF9E7A"/>
+</svg>

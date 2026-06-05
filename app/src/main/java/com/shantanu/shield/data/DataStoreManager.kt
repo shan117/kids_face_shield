@@ -229,6 +229,21 @@ class DataStoreManager @Inject constructor(@ApplicationContext private val conte
         }
     }
 
+    // Grant a budget extension for today. Bumps today's extension allowance and logs the
+    // grant to history in a SINGLE atomic edit so the budget bump and the audit entry can
+    // never disagree. The daily 07:00 poll zeroes extensions_today_ms (not the history).
+    suspend fun addExtensionMinutes(minutes: Int) {
+        if (minutes <= 0) return
+        context.dataStore.edit { preferences ->
+            val current = preferences[EXTENSIONS_TODAY_MS_KEY] ?: 0L
+            preferences[EXTENSIONS_TODAY_MS_KEY] = current + minutes * 60_000L
+            val existing = preferences[EXTENSION_HISTORY_KEY] ?: ""
+            val entry = "${System.currentTimeMillis()},$minutes"
+            preferences[EXTENSION_HISTORY_KEY] =
+                if (existing.isEmpty()) entry else "$existing;$entry"
+        }
+    }
+
     suspend fun setKidSessionEndAt(endAtMs: Long) {
         context.dataStore.edit { preferences ->
             preferences[KID_SESSION_END_AT_KEY] = endAtMs

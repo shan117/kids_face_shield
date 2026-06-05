@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-label="Shield Buddy">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#15A2BA"/>
+      <stop offset="1" stop-color="#006072"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="112" fill="url(#bg)"/>
+  <!-- little hair curl pokes above the shield = a kid -->
+  <path d="M246 120 C240 84 292 80 286 114" fill="none" stroke="#FFC24B" stroke-width="16" stroke-linecap="round"/>
+  <!-- shield doubles as the kid's head -->
+  <path d="M256 112 L380 152 Q392 156 392 176 L392 250 Q392 332 256 414 Q120 332 120 250 L120 176 Q120 156 132 152 Z" fill="#FFF7EC"/>
+  <!-- face -->
+  <circle cx="186" cy="288" r="14" fill="#FF9E7A"/>
+  <circle cx="326" cy="288" r="14" fill="#FF9E7A"/>
+  <circle cx="214" cy="252" r="18" fill="#06414E"/>
+  <circle cx="298" cy="252" r="18" fill="#06414E"/>
+  <circle cx="207" cy="245" r="6.5" fill="#FFFFFF"/>
+  <circle cx="291" cy="245" r="6.5" fill="#FFFFFF"/>
+  <path d="M212 300 Q256 344 300 300" fill="none" stroke="#06414E" stroke-width="18" stroke-linecap="round"/>
+  <!-- subtle face-scan ticks -->
+  <g fill="none" stroke="#15A2BA" stroke-width="12" stroke-linecap="round" stroke-linejoin="round" opacity="0.9">
+    <path d="M168 232 L168 212 L188 212"/>
+    <path d="M324 212 L344 212 L344 232"/>
+  </g>
+</svg>

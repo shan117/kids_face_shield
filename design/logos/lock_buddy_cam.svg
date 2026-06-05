@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-label="Lock Buddy on camera">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#15A2BA"/>
+      <stop offset="1" stop-color="#006072"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="112" fill="url(#bg)"/>
+  <!-- camera viewfinder framing -->
+  <g fill="none" stroke="#FFF7EC" stroke-width="16" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M150 200 L150 162 L188 162"/>
+    <path d="M324 162 L362 162 L362 200"/>
+    <path d="M150 348 L150 386 L188 386"/>
+    <path d="M324 386 L362 386 L362 348"/>
+  </g>
+  <!-- flash -->
+  <path d="M300 128 L307 148 L327 155 L307 162 L300 182 L293 162 L273 155 L293 148 Z" fill="#FFC24B"/>
+  <!-- shackle + kid hair tuft -->
+  <path d="M214 250 V222 Q214 184 256 184 Q298 184 298 222 V250" fill="none" stroke="#FFF7EC" stroke-width="26" stroke-linecap="round"/>
+  <path d="M250 182 C246 158 285 156 279 179" fill="none" stroke="#FFC24B" stroke-width="13" stroke-linecap="round"/>
+  <!-- lock body / happy face -->
+  <rect x="198" y="250" width="116" height="126" rx="32" fill="#FFF7EC"/>
+  <circle cx="234" cy="300" r="14" fill="#06414E"/>
+  <circle cx="278" cy="300" r="14" fill="#06414E"/>
+  <circle cx="229" cy="295" r="5" fill="#FFFFFF"/>
+  <circle cx="273" cy="295" r="5" fill="#FFFFFF"/>
+  <ellipse cx="210" cy="322" rx="15" ry="10" fill="#FF9E7A" opacity="0.85"/>
+  <ellipse cx="302" cy="322" rx="15" ry="10" fill="#FF9E7A" opacity="0.85"/>
+  <path d="M228 330 Q256 366 284 330 Q256 348 228 330 Z" fill="#06414E"/>
+  <ellipse cx="256" cy="344" rx="10" ry="6" fill="#FF9E7A"/>
+</svg>

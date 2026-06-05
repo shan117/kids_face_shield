@@ -34,6 +34,8 @@ data class StatsSnapshot(
     // Kid-mode
     val budgetMs: Long = 0,
     val budgetUsedMs: Long = 0,
+    // Parent-granted budget extension for today (ms). Shown in the Kid view.
+    val extensionsTodayMs: Long = 0,
     val kidTopApps: List<AppUsageBucket> = emptyList(),
 
     // Weekly
@@ -89,9 +91,18 @@ class StatsViewModel @Inject constructor(
 
     private suspend fun computeSnapshot(): StatsSnapshot {
         val mode = _viewMode.value
-        val totalToday = repo.totalMsToday()
-        val totalYesterday = repo.totalMsForDay(1)
-        val parentTop = repo.usageToday().take(6)
+        // App-set filter for this view. Kid view mirrors the budget (controlled apps only);
+        // parent view is broader (everyday apps like Gmail/Photos) but still drops pure
+        // utilities like Maps. All usage windows below are 07:00-anchored budget-days.
+        val include: (String) -> Boolean = if (mode == StatsViewMode.KID) {
+            { com.shantanu.shield.util.AllowedApps.isControlledPackage(context, it) }
+        } else {
+            { com.shantanu.shield.util.AllowedApps.isVisibleInParentStats(context, it) }
+        }
+
+        val totalToday = repo.totalMsToday(include)
+        val totalYesterday = repo.totalMsForDay(1, include)
+        val parentTop = repo.usageToday(include).take(6)
         val fpRecordsToday = repo.freePlayRecordsToday()
         val grantedMs = fpRecordsToday.sumOf {
             val today = repo.todayWindow()
@@ -101,19 +112,20 @@ class StatsViewModel @Inject constructor(
                 if (ov == 0L) 0L else it.grantedMs
             }
         }
-        val fpAppUsage = repo.freePlayUsageToday()
+        val fpAppUsage = repo.freePlayUsageToday(include)
         val fpUsedMs = fpAppUsage.sumOf { it.foregroundMs }
 
         val budget = dataStoreManager.dailyLimitMinutes.first() * 60_000L
-        // We prefer today's actual measured usage over the persisted budget counter
-        // because that counter only ticks while Kid Mode is active. Showing it on
-        // the Stats screen would freeze at 0 (or stale data) for parents peeking
-        // at the Kid view, which is confusing.
-        val budgetUsed = totalToday
+        // Read the SAME persisted counter the service ticks and the Kid Mode tab shows,
+        // so the budget ring here matches the Kid Mode card and the actual lock decision
+        // exactly (anchored at 07:00, controlled-apps-only). The Kid view is only rendered
+        // when ownerType == "kid", i.e. when that counter is live, so it is never stale.
+        val budgetUsed = dataStoreManager.screenTimeUsedMs.first()
+        val extensionsToday = dataStoreManager.extensionsTodayMs.first()
 
-        val week = repo.dailyTotals(7)
-        val weeklyAvgs = repo.weeklyDailyAverages(4)
-        val monthAvg = repo.monthToDateAverageMs()
+        val week = repo.dailyTotals(7, include)
+        val weeklyAvgs = repo.weeklyDailyAverages(4, include)
+        val monthAvg = repo.monthToDateAverageMs(include)
         val trendDelta = computeTrendDelta(weeklyAvgs)
         val insights = buildInsights(mode, totalToday, totalYesterday, parentTop, fpAppUsage, budget, budgetUsed, week, weeklyAvgs, monthAvg, trendDelta)
 
@@ -128,6 +140,7 @@ class StatsViewModel @Inject constructor(
             freePlayApps = fpAppUsage,
             budgetMs = budget,
             budgetUsedMs = budgetUsed,
+            extensionsTodayMs = extensionsToday,
             kidTopApps = parentTop,
             week = week,
             weeklyDailyAverages = weeklyAvgs,

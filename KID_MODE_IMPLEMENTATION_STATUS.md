@@ -19,6 +19,7 @@ Legend: `[ ]` pending · `[~]` in progress · `[x]` done · `[!]` reverted/block
 | 6 | Dedicated kid-mode lock message (no extension buttons, per user decision) | `[x]` | `KidModeLockView` shown when kid-mode lock fires: "Your daily usage limit is over. Please engage yourself in other activities. More screen time can harm your eyes, brain, and reduce your concentration power." |
 | 7 | Stats / Dashboard tab — owner-driven Parent vs Kid views, 7-day chart, top apps, weekly trends, monthly average | `[x]` | Build SUCCESSFUL. Stats tab live with donut + sparkbars + Trends (4-week bars + ↓/↑/→ pill + monthly avg). Switcher restored as disabled segmented row with Lock icon. |
 | 8 | Cross-cutting polish + hardening (tab reorder, unified header, face-doesn't-match UX, coach-mark layout, Auto-Backup disable, brand palette + Roboto typography) | `[x]` | Build SUCCESSFUL. Consistent visuals + biometric-safe storage across all Android devices. |
+| 9 | Consistency fixes (shared controlled-app predicate) + budget extensions revival | `[x]` | One `isControlledPackage` predicate now drives budget poll, lock decision, AND Stats. Curated time-sink list (browsers/YouTube/etc.) controlled even when pre-installed; utilities (Gmail/Maps) free. Kid budget number unified to the persisted counter. Extensions re-enabled from the Kid Mode tab. |
 
 ---
 
@@ -154,16 +155,24 @@ fields yet. Safe to ship even if Phase 2 is delayed.
 - `extensions_today_ms` / `extension_history` keys remain in `DataStoreManager`
   for any future use, but nothing currently writes to them. The daily 07:00
   reset still zeros `extensions_today_ms` (Phase 4 logic, unchanged).
+  _(Superseded by Phase 9: extensions are now granted from the Kid Mode tab and
+  both keys are written again. The lock screen still shows no extension buttons.)_
 - Files touched: `FaceLockOverlayContent.kt` (new `KidModeLockView`,
   `isKidModeLock` param), `LockActivity.kt` (new `EXTRA_KID_MODE_LOCK`),
   `AppLockForegroundService.kt` (thread `isKidModeLock` through
   `enforceLock` → `launchLockActivity`).
 - Build: SUCCESSFUL.
 ### Phase 7 — _done_  (Stats / Dashboard)
+> ⚠️ Historical note: this phase originally claimed the chart used the "same
+> predicate as Phase 4/5 enforcement … byte-for-byte." That was **not** true — the
+> service excluded all `FLAG_SYSTEM` apps while Stats kept updated-system apps, so
+> apps like Chrome appeared in the chart but never counted against the budget.
+> Phase 9 fixed this by routing all three through one shared `isControlledPackage`.
+
 - **`StatsRepository`** (`ui/stats/StatsRepository.kt`):
   - `dailyUsage(days)` — `UsageStatsManager` per-day buckets, controlled apps only
-    (Allowed-set + self + non-updated system apps excluded — same predicate as
-    Phase 4/5 enforcement, so chart and lock decisions agree byte-for-byte).
+    (see Phase 9 — now uses the shared `AllowedApps.isControlledPackage` predicate,
+    identical to the budget poll and lock decision).
   - `topAppsToday()` / `topAppsForRange(days)` — top-N controlled apps with
     `pm.getApplicationLabel` resolution + cached app icon.
   - `weeklyDailyAverages(weeks)` — last N rolling 7-day-window averages, used
@@ -273,6 +282,102 @@ fields yet. Safe to ship even if Phase 2 is delayed.
   `libs.versions.toml` + `app/build.gradle.kts`.
 - Result: same teal primary, same Roboto, same chart colors on Realme,
   Motorola, Pixel, Samsung — no more OEM-driven cosmetic drift.
+
+### Phase 9 — _done_  (consistency fixes + budget extensions)
+**Problem found in audit:** three different "is this app controllable?" predicates and
+two different "today's usage" computations had drifted apart:
+- Budget poll & lock excluded **all** `FLAG_SYSTEM` apps (so Chrome/YouTube were free).
+- Stats kept updated-system apps (so Chrome **showed** as usage that was never enforced).
+- The Kid Mode "Today" card read the persisted 07:00-anchored counter; the Stats kid
+  ring read its own midnight-anchored, event-based number → two different totals.
+
+**Shared predicate** (`util/AllowedApps.kt`):
+- New `TIME_SINK_PACKAGES` — curated pre-installed addictive apps that ARE controlled
+  even though they ship as system apps: Chrome + OEM browsers (Samsung Internet, MIUI,
+  Heytap, Vivo, Huawei), YouTube, Google TV, Play Games, Google News.
+- New pure `isControlled(pkg, selfPkg, isSystemApp)` (unit-tested) + context-bound
+  `isControlledPackage(context, pkg)`. Rule: self → never; curated time-sink → always;
+  any non-system (user-installed) app → yes; other pre-installed utilities (Gmail, Maps,
+  Phone, Messages, Settings) → no.
+- Routed through this predicate: `AppLockForegroundService.pollScreenTime` (budget),
+  `AppLockForegroundService.shouldLockForKidMode` (lock), `StatsRepository.buildBucket`
+  (dashboard). All three now agree by construction.
+- Deliberately **not** changed: the parent-mode Protect picker
+  (`MainViewModel.loadInstalledApps`) stays broader — a parent may still face-lock Gmail
+  in parent mode. That's a separate feature from the kid budget.
+
+**Unified kid budget number:** `StatsViewModel` kid `budgetUsedMs` now reads the same
+persisted `screen_time_used_ms` the service writes and the Kid Mode card shows (the Kid
+view only renders when `ownerType == "kid"`, when that counter is live). The Kid Mode
+card, the Stats ring, and the lock decision are now the same number.
+
+**Budget extensions re-enabled** (reverses the Phase 6 scope-down, per user decision):
+- `DataStoreManager.addExtensionMinutes(minutes)` — atomic single edit that bumps
+  `extensions_today_ms` AND appends to `extension_history`.
+- `MainViewModel.grantExtension(minutes)` (coerced 1–240).
+- Kid Mode tab: new `BudgetExtensionCard` with +15 / +30 / +60 buttons (gated behind the
+  existing "Protect This App" face lock that guards the whole tab in Kid Mode). The
+  enforcement check `usedMin >= dailyLimit + extensionMin` now sees a non-zero
+  `extensionMin`, so granting directly relaxes the lock. Still resets at 07:00.
+- Stats kid section: `extensionsTodayMs` surfaced as a "Budget extended +X min today"
+  pill under the budget ring.
+
+**Hygiene:** deleted the two stub `AppLockApplication.kt` files (`com.example.myapplication`
+empty + `com.shantanu.guard` "// Empty to fix conflict") — package-rename debris; the live
+one is `com.shantanu.shield.AppLockApplication`.
+
+**Stats ring honours extensions:** the kid budget ring now fills against the EFFECTIVE
+limit (`budgetMs + extensionsTodayMs`), so "over" on the ring matches the actual lock
+threshold and the Kid Mode card. (Previously the ring used the base budget and turned red
+while the app was still unlocked.)
+
+**07:00 anchoring (Stats):** `StatsRepository` day windows were re-anchored from calendar
+midnight to the 07:00 budget-day boundary (DST-safe `Calendar` arithmetic) — so the
+dashboard's "today", 7-day chart, weekly averages, and month-to-date all share the same
+day boundary the service resets on. `todayWindow()` is now just `dayWindow(0)`.
+
+**Budget counter unified with the charts (event-based measurement):** the budget poll used
+to read `queryAndAggregateUsageStats().totalTimeInForeground`, which is reported against
+midnight-aligned daily buckets — so usage from **midnight→07:00 leaked into today's budget**,
+and the number didn't match the Stats charts (which already replay events). Fixed:
+- New `util/UsageMeasure.kt` — the single source of truth for "foreground ms per package in
+  a window," event-based (pair `ACTIVITY_RESUMED` → next `PAUSED/STOPPED`, sum deltas; open
+  sessions count to the window end). Pure `reduceForegroundMs` + a thin Android adapter.
+- `StatsRepository.usageInWindow` and `pollScreenTime` BOTH measure through it, so the budget
+  ring and the charts use the same method over the same 07:00 window — precise to the 07:00
+  line, no midnight leak, no aggregate-vs-event drift.
+- `pollScreenTime` now runs the (full-day) event scan on `Dispatchers.IO`, and the 07:00
+  reset explicitly zeroes `screen_time_used_ms` (so a fresh day shows 0 even before any app
+  is opened). The empty-result guard is preserved (no usage-access → keep the last value,
+  never overwrite enforcement state with 0).
+- Net behaviour change: pre-07:00 usage no longer counts against the daytime budget. It only
+  ever *reduces* the counted total, so it never causes a wrongful lock. Unit-tested via
+  `UsageMeasureTest` (unclosed sessions, dangling pauses, out-of-order events, re-resume).
+
+**Always-allowed apps now count toward the budget:** `pollScreenTime` no longer subtracts
+the always-allowed set, so WhatsApp / custom-allowed apps' time is included in
+`screen_time_used_ms` — the budget ring and the Stats charts now include the same apps.
+Those apps are still **never locked** (`shouldLockForKidMode` keeps its allowed-set bypass),
+so they consume the shared budget yet stay openable; once the limit is hit only the
+non-allowed apps lock. (Reverses the original FEATURE_PLAN §4 exclusion, per user decision.)
+
+**Parent vs kid app-set (Stats):** usage queries now take an `include` predicate.
+- **Kid view** → `isControlledPackage` (budget basis: user apps + time-sinks).
+- **Parent view** → new `AllowedApps.isVisibleInParentStats` (pure core `isParentVisible`):
+  broader — user apps + updated-system apps (Gmail, Photos, Drive, Chrome) — but MINUS a
+  `UTILITY_PACKAGES` denylist of pure utilities. Currently `{ Google Maps }`; extend it to
+  drop more. So the parent dashboard shows Gmail but not Maps, while the kid budget/lock
+  are unchanged.
+`StatsViewModel.computeSnapshot` picks the predicate from `viewMode` and threads it through
+every usage call.
+
+**Tests:** first real unit tests — `app/src/test/java/com/shantanu/shield/util/AllowedAppsTest.kt`
+locks in both the controlled predicate (`isControlled`) and the parent-visible predicate
+(`isParentVisible`) so the surfaces can't drift apart again.
+
+- Files touched: `util/AllowedApps.kt`, `service/AppLockForegroundService.kt`,
+  `ui/stats/StatsRepository.kt`, `ui/stats/StatsViewModel.kt`, `ui/stats/StatsScreen.kt`,
+  `data/DataStoreManager.kt`, `MainViewModel.kt`, `MainActivity.kt`, + new test.
 
 ---
 

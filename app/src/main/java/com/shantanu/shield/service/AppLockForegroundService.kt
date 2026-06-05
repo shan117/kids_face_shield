@@ -5,7 +5,6 @@ import android.app.usage.UsageEvents
 import android.app.usage.UsageStatsManager
 import android.content.Context
 import android.content.Intent
-import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.graphics.PixelFormat
@@ -276,43 +275,49 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
     private suspend fun pollScreenTime() {
         val now = System.currentTimeMillis()
 
-        // Per-day reset: if the day-key changed since last seen, zero out today's
-        // extensions and stamp the new key.
+        // Per-day reset at the 07:00 budget boundary: zero today's used-time AND extensions,
+        // then stamp the new key. Zeroing used-time here (rather than relying only on the
+        // windowed re-measure below) guarantees a clean slate the instant the day rolls over,
+        // even if no app has been opened yet this morning.
         val todayKey = dayKeyForBudget(now)
         val lastReset = dataStoreManager.screenTimeLastResetDate.first()
         if (todayKey != lastReset) {
+            dataStoreManager.setScreenTimeUsedMs(0L)
             dataStoreManager.setExtensionsTodayMs(0L)
             dataStoreManager.setScreenTimeLastResetDate(todayKey)
-            Log.d("ScreenTime", "Daily reset: extensions zeroed for $todayKey")
+            Log.d("ScreenTime", "Daily reset: used + extensions zeroed for $todayKey")
         }
 
+        // Measure foreground time per package since the most recent 07:00 using the SAME
+        // event-based method the Stats charts use (UsageMeasure). This is precise to the
+        // 07:00 boundary — unlike queryAndAggregateUsageStats, whose per-bucket
+        // totalTimeInForeground leaks midnight→07:00 usage into today's budget. Run off the
+        // main thread: a full-day event scan every 60s shouldn't touch the UI dispatcher.
         val windowStart = mostRecentSevenAm(now)
         val usm = getSystemService(Context.USAGE_STATS_SERVICE) as UsageStatsManager
-        val stats = usm.queryAndAggregateUsageStats(windowStart, now) ?: return
-        if (stats.isEmpty()) {
-            // No permission or no events — nothing to do.
+        val perPackageMs = withContext(Dispatchers.IO) {
+            com.shantanu.shield.util.UsageMeasure.foregroundMsByPackage(usm, windowStart, now)
+        }
+        if (perPackageMs.isEmpty()) {
+            // No usage-access permission, or genuinely no activity since 07:00. Leave the
+            // current value untouched (the reset above already cleared it at the rollover),
+            // rather than overwriting a valid enforcement value with 0.
             return
         }
 
-        val allowed = com.shantanu.shield.util.AllowedApps.computeAlwaysAllowedSet(this, dataStoreManager)
-        val pm = packageManager
         var controlledMs = 0L
-        for ((pkg, stat) in stats) {
-            if (pkg in allowed) continue
-            if (pkg == packageName) continue
-            // Only user-installed Play-Store apps count against the budget. All
-            // system apps (Phone, Messages, Settings, Camera, Clock, the launcher,
-            // even updated-system apps like Google Phone on Pixel) are excluded so
-            // their usage doesn't eat into the kid's screen-time quota.
-            val flags = try {
-                pm.getApplicationInfo(pkg, 0).flags
-            } catch (_: PackageManager.NameNotFoundException) {
-                continue
-            }
-            val isSystem = (flags and ApplicationInfo.FLAG_SYSTEM) != 0
-            if (isSystem) continue
-
-            controlledMs += stat.totalTimeInForeground
+        for ((pkg, ms) in perPackageMs) {
+            if (ms <= 0L) continue
+            // Canonical predicate: user-installed apps + curated time-sinks (Chrome,
+            // YouTube, …) count; pre-installed utilities (Gmail, Maps, Settings) don't.
+            //
+            // Always-allowed apps (WhatsApp / custom) ARE counted here: their time counts
+            // toward the daily total, so the budget ring and the Stats charts include the
+            // same apps. They are still never *locked* — shouldLockForKidMode keeps its own
+            // allowed-set bypass — so an allowed app consumes the shared budget yet stays
+            // openable, and only the non-allowed apps lock once the limit is reached.
+            if (!com.shantanu.shield.util.AllowedApps.isControlledPackage(this, pkg)) continue
+            controlledMs += ms
         }
         dataStoreManager.setScreenTimeUsedMs(controlledMs)
     }
@@ -363,20 +368,17 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
         if (ownerType != "kid") return false
         if (pkg == this.packageName) return false
 
-        // All system apps are unrestricted in Kid Mode (Phone, Messages, Settings,
-        // Camera, Clock, etc. — both pure system AND updated-system apps like the
-        // Google Phone/Messages dialer on Pixels). The user-installed Play Store apps
-        // are the only ones the budget applies to. Settings can still be locked
-        // independently via the parent-mode `lockDeviceSettings` toggle (which uses
-        // the `protectedApps` path and runs regardless of owner type).
-        val flags = try {
-            packageManager.getApplicationInfo(pkg, 0).flags
-        } catch (_: PackageManager.NameNotFoundException) {
-            return false
-        }
-        val isSystem = (flags and ApplicationInfo.FLAG_SYSTEM) != 0
-        if (isSystem) return false
+        // Only *controlled* apps are subject to the budget / night lock. Pre-installed
+        // utilities (Phone, Messages, Settings, Camera, Gmail, Maps) stay free; curated
+        // time-sinks (Chrome, YouTube, …) and all user-installed apps are controlled.
+        // Same predicate as the budget poll & Stats, so the three classify apps the same
+        // way. (Settings can still be locked independently via the parent-mode
+        // `lockDeviceSettings` toggle, which runs regardless of owner.)
+        if (!com.shantanu.shield.util.AllowedApps.isControlledPackage(this, pkg)) return false
 
+        // Always-allowed apps (Phone/SMS/WhatsApp/custom) are never locked, so emergency
+        // comms keep working at/over budget and at night. Their time still COUNTS toward
+        // the budget (see pollScreenTime) — they just can't themselves be blocked.
         val allowed = com.shantanu.shield.util.AllowedApps.computeAlwaysAllowedSet(this, dataStoreManager)
         if (pkg in allowed) return false
 
