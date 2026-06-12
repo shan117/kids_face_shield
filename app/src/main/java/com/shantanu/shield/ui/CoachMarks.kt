@@ -94,50 +94,38 @@ object CoachTours {
         CoachStep(
             id = "settings-welcome",
             title = "Settings — quick tour",
-            body = "A 4-stop walkthrough of what each section here does. Skip anytime.",
+            body = "A quick walkthrough of what each section here does. Skip anytime.",
             targetId = null
         ),
         CoachStep(
             id = "settings-kid-mode",
             title = "Kid Mode",
-            body = "Set a daily screen-time budget for your kid, pick which apps stay always-allowed (calls, messages), and turn on a night-time lock. Tap into Kid Mode any time to adjust.",
+            body = "Set a daily screen-time budget, pick which apps stay always-allowed (calls, messages), and turn on a night-time lock. Tap in any time to adjust.",
             targetId = "settings-kid-mode"
         ),
         CoachStep(
-            id = "settings-intruder-style",
-            title = "Intruder Feedback Style",
-            body = "Pick what the locked app shows when someone other than you tries to open it: a fake hardware error, a polite wellness warning, or a spiritual quote.",
-            targetId = "settings-intruder-style"
+            id = "settings-multikid",
+            title = "Multiple Kids",
+            body = "Sharing one phone between two kids? Turn this on and enrol each child's face — the app identifies who's holding the phone and applies that child's own budget, allowed apps and per-app limits.",
+            targetId = "settings-multikid"
         ),
         CoachStep(
             id = "settings-tamper",
             title = "Tamper Protection",
-            body = "One master switch turns on three protections. Tap it for max safety, or expand to flip each one individually — let's look at them.",
+            body = "Stop a child uninstalling Kids Shield or changing its settings. Tap in to turn on three layers: lock system settings, protect this app, and block uninstall.",
             targetId = "settings-tamper"
         ),
         CoachStep(
-            id = "tamper-lock-settings",
-            title = "Lock System Settings",
-            body = "Require Face ID to open the device Settings shortcut — so a child can't reach Force-Stop, app permissions, or Uninstall on their own.",
-            targetId = "tamper-lock-settings"
+            id = "settings-appearance",
+            title = "Appearance",
+            body = "Pick an accent theme, and choose what a protected app shows to an intruder: a fake hardware error, a wellness note, or a spiritual quote.",
+            targetId = "settings-appearance"
         ),
         CoachStep(
-            id = "tamper-protect-app",
-            title = "Protect This App",
-            body = "Require Face ID to open Kids Shield itself. Even if your child finds the icon, they can't disable budgets or allowed apps without your face.",
-            targetId = "tamper-protect-app"
-        ),
-        CoachStep(
-            id = "tamper-prevent-uninstall",
-            title = "Prevent Uninstall",
-            body = "Register as Device Admin so Android blocks the Uninstall action entirely. Turn off any time from Settings > Device Admin if you need to remove the app.",
-            targetId = "tamper-prevent-uninstall"
-        ),
-        CoachStep(
-            id = "settings-security-foundation",
-            title = "Security Foundation",
-            body = "The five system permissions Kids Shield needs to keep running 24/7. Each row jumps you straight into the right OS settings page.",
-            targetId = "settings-security-foundation"
+            id = "settings-permissions",
+            title = "Permissions",
+            body = "The system permissions Kids Shield needs to keep running 24/7. Each row jumps you straight into the right OS settings page.",
+            targetId = "settings-permissions"
         ),
         CoachStep(
             id = "settings-done",

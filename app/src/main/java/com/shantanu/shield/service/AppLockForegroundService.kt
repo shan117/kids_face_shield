@@ -66,6 +66,14 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
     // isFreePlayActive() without an additional DataStore read on every check.
     @Volatile private var cachedKidSessionEndAtMs: Long = 0L
 
+    // Cached per-package foreground ms (from the 60s poll) so the per-app-limit lock check doesn't
+    // rescan UsageStats on every decision.
+    @Volatile private var perAppUsageMs: Map<String, Long> = emptyMap()
+
+    // Same idea but per kid (Multiple-kids): profileId -> (package -> foreground ms today), so a
+    // per-kid per-app cap can be evaluated without a per-decision UsageStats rescan.
+    @Volatile private var perProfileAppUsageMs: Map<String, Map<String, Long>> = emptyMap()
+
     private fun isFreePlayActive(): Boolean = System.currentTimeMillis() < cachedKidSessionEndAtMs
 
     private fun isAdminActiveCached(): Boolean {
@@ -98,6 +106,17 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
     
     private var monitorJob: Job? = null
     private var screenTimePollJob: Job? = null
+
+    // Premium "Auto-lock new apps": a runtime receiver (reliable for implicit PACKAGE_ADDED, unlike a
+    // manifest one) that locks each newly-installed app and notifies the parent.
+    private val packageAddedReceiver = object : android.content.BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            if (intent.action != Intent.ACTION_PACKAGE_ADDED) return
+            if (intent.getBooleanExtra(Intent.EXTRA_REPLACING, false)) return  // an update, not a new install
+            val pkg = intent.data?.schemeSpecificPart ?: return
+            serviceScope.launch { handleNewAppInstalled(pkg) }
+        }
+    }
     private val launcherPackages = mutableSetOf<String>()
     private val settingsPackages = mutableSetOf<String>()
     // Settings activities that act as the app's "home / entry" — i.e. what launches when the user
@@ -157,6 +176,8 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
         const val EXTRA_PACKAGE_NAME = "EXTRA_PACKAGE_NAME"
         const val ACTION_LOCK_RESULT = "ACTION_LOCK_RESULT"
         const val EXTRA_AUTH_SUCCESS = "EXTRA_AUTH_SUCCESS"
+        const val ACTION_APPROVE_NEW_APP = "ACTION_APPROVE_NEW_APP"
+        const val NEW_APP_CHANNEL_ID = "NewAppChannel"
     }
 
     override fun onCreate() {
@@ -174,6 +195,12 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
         }
         startAppMonitoring()
         startScreenTimePolling()
+        androidx.core.content.ContextCompat.registerReceiver(
+            this,
+            packageAddedReceiver,
+            android.content.IntentFilter(Intent.ACTION_PACKAGE_ADDED).apply { addDataScheme("package") },
+            androidx.core.content.ContextCompat.RECEIVER_NOT_EXPORTED
+        )
         // Keep the Free-Play cache in lock-step with DataStore so the lock decision
         // path can answer synchronously. Collector exits when the service does.
         // Also: post Free-Play start/end notifications by watching for transitions,
@@ -305,6 +332,9 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
             return
         }
 
+        // Cache for per-app-limit checks (avoids a UsageStats rescan on every lock decision).
+        perAppUsageMs = perPackageMs
+
         var controlledMs = 0L
         for ((pkg, ms) in perPackageMs) {
             if (ms <= 0L) continue
@@ -320,6 +350,59 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
             controlledMs += ms
         }
         dataStoreManager.setScreenTimeUsedMs(controlledMs)
+
+        // Per-profile attribution for Multiple-kids mode (only once both kids are enrolled).
+        if (isMultiKidActive()) {
+            // Keep the active kid's session ticking up to now, so their usage window grows.
+            val activeId = com.shantanu.shield.kid.MultiKidEnforcement.activeProfileId(
+                dataStoreManager.profileSessions.first(), now
+            )
+            if (activeId != null) {
+                dataStoreManager.extendLatestSession(activeId, now, com.shantanu.shield.kid.MultiKidEnforcement.DEFAULT_GRACE_MS)
+            }
+            updatePerProfileUsage(windowStart, now)
+        }
+    }
+
+    // Recompute each kid profile's used-time from its attributed sessions (UsageMeasure ∩
+    // ProfileSession), controlled apps only — same predicate/window as the flat poll. Idempotent.
+    private suspend fun updatePerProfileUsage(windowStart: Long, now: Long) {
+        val profiles = dataStoreManager.kidProfiles.first()
+        if (profiles.isEmpty()) return
+        val sessions = dataStoreManager.profileSessions.first().filter { it.endMs >= windowStart }
+        val usm = getSystemService(Context.USAGE_STATS_SERVICE) as UsageStatsManager
+        val result = withContext(Dispatchers.IO) {
+            val appUsage = LinkedHashMap<String, Map<String, Long>>()
+            val profs = profiles.map { p ->
+                // Each kid's own allow-list is excluded from THEIR budget.
+                val perKidAllowed = com.shantanu.shield.util.AllowedApps.computeAlwaysAllowedSet(
+                    this@AppLockForegroundService, p.allowedPreset, p.customAllowed
+                )
+                var used = 0L
+                val perPkgTotals = HashMap<String, Long>()
+                for (s in sessions) {
+                    if (s.profileId != p.id) continue
+                    val ws = maxOf(s.startMs, windowStart)
+                    val we = minOf(s.endMs, now)
+                    if (we <= ws) continue
+                    val perPkg = com.shantanu.shield.util.UsageMeasure.foregroundMsByPackage(usm, ws, we)
+                    for ((pkg, ms) in perPkg) {
+                        if (ms <= 0L) continue
+                        if (!com.shantanu.shield.util.AllowedApps.isControlledPackage(this@AppLockForegroundService, pkg)) continue
+                        // Per-app usage covers every controlled app (incl. this kid's allowed ones)
+                        // so a per-app cap is enforceable even on an otherwise-allowed app.
+                        perPkgTotals[pkg] = (perPkgTotals[pkg] ?: 0L) + ms
+                        if (pkg in perKidAllowed) continue
+                        used += ms
+                    }
+                }
+                appUsage[p.id] = perPkgTotals
+                p.copy(usedMs = used)
+            }
+            profs to appUsage
+        }
+        perProfileAppUsageMs = result.second
+        if (result.first != profiles) dataStoreManager.setKidProfiles(result.first)
     }
 
     // Most-recent 07:00 boundary: today's 07:00 if we're past it, else yesterday's 07:00.
@@ -365,7 +448,10 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
     // -------------------------------------------------------------------------
     private suspend fun shouldLockForKidMode(pkg: String, nowMs: Long): Boolean {
         val ownerType = dataStoreManager.ownerType.first()
-        if (ownerType != "kid") return false
+        val multiKid = isMultiKidActive()
+        // Independent modes: enforce if single Kid Mode is on OR Multiple-kids is active (both kids
+        // enrolled). Multiple Kids no longer rides on the single Kid Mode toggle.
+        if (ownerType != "kid" && !multiKid) return false
         if (pkg == this.packageName) return false
 
         // Only *controlled* apps are subject to the budget / night lock. Pre-installed
@@ -376,9 +462,49 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
         // `lockDeviceSettings` toggle, which runs regardless of owner.)
         if (!com.shantanu.shield.util.AllowedApps.isControlledPackage(this, pkg)) return false
 
-        // Always-allowed apps (Phone/SMS/WhatsApp/custom) are never locked, so emergency
-        // comms keep working at/over budget and at night. Their time still COUNTS toward
-        // the budget (see pollScreenTime) — they just can't themselves be blocked.
+        // ---- Multiple-kids branch (gated; enforces only once BOTH kids are enrolled) ----
+        // Each kid has their OWN allow-list, so the per-kid "free app" bypass lives inside this branch;
+        // the global allow-list below applies to single-kid only. When the toggle is OFF (every
+        // single-kid/parent install) this block is skipped, so the existing flow is unchanged.
+        if (multiKid) {
+            val activeId = com.shantanu.shield.kid.MultiKidEnforcement.activeProfileId(
+                dataStoreManager.profileSessions.first(), nowMs
+            )
+            val active = dataStoreManager.kidProfiles.first().firstOrNull { it.id == activeId }
+            if (active != null) {
+                // Per-app cap for THIS kid — checked before the allowed bypass, so a cap can
+                // override an otherwise-allowed app (mirrors the single-kid ordering below).
+                val kidLimits = dataStoreManager.kidPerAppLimits.first()[active.id].orEmpty()
+                if (kidLimits.isNotEmpty() &&
+                    com.shantanu.shield.kid.PerAppLimits.isOver(pkg, perProfileAppUsageMs[active.id].orEmpty(), kidLimits)
+                ) return true
+                // This kid's own allowed apps are free (never locked, don't count).
+                val perKidAllowed = com.shantanu.shield.util.AllowedApps.computeAlwaysAllowedSet(
+                    this, active.allowedPreset, active.customAllowed
+                )
+                if (pkg in perKidAllowed) return false
+                return com.shantanu.shield.kid.MultiKidEnforcement.shouldLock(
+                    usedMs = active.usedMs,
+                    dailyLimitMinutes = active.dailyLimitMinutes,
+                    extensionsMs = active.extensionsMs,
+                    isNight = isNightWindow(nowMs)
+                )
+            }
+            // Stale identity (both kids enrolled): any kid's allowed app opens without a scan (so
+            // emergency comms work), otherwise lock so the identify camera runs to pick the kid.
+            if (pkg in multiKidUnionAllowed()) return false
+            return true
+        }
+
+        // Per-app limit (single-kid): lock a specific app once its own usage reaches its limit,
+        // independent of the overall budget. Applies before the allowed-set bypass, so a parent can
+        // cap even an otherwise-allowed app. (Multi-kid per-app limits are a later add.)
+        val perAppLimits = dataStoreManager.perAppLimits.first()
+        if (perAppLimits.isNotEmpty() &&
+            com.shantanu.shield.kid.PerAppLimits.isOver(pkg, perAppUsageMs, perAppLimits)) return true
+
+        // Single-kid: always-allowed apps (Phone/SMS/WhatsApp/custom) are never locked, so emergency
+        // comms keep working at/over budget and at night. Their time still COUNTS toward the budget.
         val allowed = com.shantanu.shield.util.AllowedApps.computeAlwaysAllowedSet(this, dataStoreManager)
         if (pkg in allowed) return false
 
@@ -400,6 +526,35 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
         val hour = cal.get(java.util.Calendar.HOUR_OF_DAY)
         // Night-lock window: 22:00 inclusive to 06:59 inclusive (i.e. open at 07:00 sharp).
         return hour >= 22 || hour < 7
+    }
+
+    // True when a multi-kid lock should run the IDENTIFY camera (vs a plain budget/night lock):
+    // multi-kid on, a controlled non-allowed app, kid faces enrolled, and no kid currently
+    // identified (stale). Mirrors the stale-lock branch in shouldLockForKidMode.
+    // Multi-kid only ENFORCES once BOTH kids' faces are enrolled. If the toggle is on but fewer than
+    // two faces exist, this is false → the device falls back to single-kid (and the UI prompts the
+    // parent to finish enrolment). So a half-configured multi-kid never half-works.
+    private suspend fun isMultiKidActive(): Boolean =
+        dataStoreManager.multiKidEnabled.first() && dataStoreManager.kidFaceEmbeddings.first().size >= 2
+
+    // Union of every kid's allow-list — apps that bypass the identify camera, so any kid's allowed
+    // app (and emergency comms) opens without a scan while no kid is identified yet.
+    private suspend fun multiKidUnionAllowed(): Set<String> {
+        val out = HashSet<String>()
+        for (p in dataStoreManager.kidProfiles.first()) {
+            out += com.shantanu.shield.util.AllowedApps.computeAlwaysAllowedSet(this, p.allowedPreset, p.customAllowed)
+        }
+        return out
+    }
+
+    private suspend fun isIdentifyLock(pkg: String, nowMs: Long): Boolean {
+        if (!isMultiKidActive()) return false
+        if (!com.shantanu.shield.util.AllowedApps.isControlledPackage(this, pkg)) return false
+        if (pkg in multiKidUnionAllowed()) return false
+        val activeId = com.shantanu.shield.kid.MultiKidEnforcement.activeProfileId(
+            dataStoreManager.profileSessions.first(), nowMs
+        )
+        return activeId == null
     }
 
     // The effective protected set = user-selected apps, plus the system Settings package when the
@@ -440,9 +595,10 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
             val sessionValid = (currentlyUnlockedPackage == pkg && (currentTime - lastAuthTime) < REAUTH_INTERVAL_MS)
             if (sessionValid) return@launch
             if (isLockActive) return@launch
-            Log.d("AppLock", "Watchdog: $pkg foreground without overlay (critical=$challengeCritical kid=$kidModeLock). Forcing show.")
+            val identifyMode = kidModeLock && isIdentifyLock(pkg, System.currentTimeMillis())
+            Log.d("AppLock", "Watchdog: $pkg foreground without overlay (critical=$challengeCritical kid=$kidModeLock identify=$identifyMode). Forcing show.")
             withContext(Dispatchers.Main) {
-                if (!isLockActive) enforceLock(pkg, System.currentTimeMillis(), forceActivity = kidModeLock, isKidModeLock = kidModeLock)
+                if (!isLockActive) enforceLock(pkg, System.currentTimeMillis(), forceActivity = kidModeLock, isKidModeLock = kidModeLock, identifyMode = identifyMode)
             }
         }
     }
@@ -575,7 +731,8 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
                 if (!sessionValid) {
                     if (kidModeLock) Log.d("AppLock", "Kid Mode lock fired for $packageName")
                     if (freePlaySelfLock) Log.d("AppLock", "Free-Play self-lock fired for $packageName")
-                    enforceLock(packageName, eventTime, forceActivity = kidModeLock, isKidModeLock = kidModeLock)
+                    val identifyMode = kidModeLock && isIdentifyLock(packageName, System.currentTimeMillis())
+                    enforceLock(packageName, eventTime, forceActivity = kidModeLock, isKidModeLock = kidModeLock, identifyMode = identifyMode)
                 }
             } else if (!protectedApps.contains(packageName)) {
                 // Leaving protected app to an unprotected one (or skipping a bypassable sub-page).
@@ -619,7 +776,7 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
     // on some OEMs (system gestures, the brief gap between Home → re-open recents → re-foreground),
     // so kid-mode goes through the same robust full-screen LockActivity the system Settings lock
     // uses. Back/Home from LockActivity sends the user Home and re-arms the lock on next entry.
-    private fun enforceLock(packageName: String, eventTime: Long, forceActivity: Boolean = false, isKidModeLock: Boolean = false) {
+    private fun enforceLock(packageName: String, eventTime: Long, forceActivity: Boolean = false, isKidModeLock: Boolean = false, identifyMode: Boolean = false) {
         // If overlay permission was revoked (e.g., user cleared app data, or first-run
         // before granting), fall back to the full-screen LockActivity path so we don't
         // crash with BadTokenException when adding TYPE_APPLICATION_OVERLAY.
@@ -627,13 +784,13 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
             forceActivity ||
             !Settings.canDrawOverlays(this)
         if (mustUseActivity) {
-            launchLockActivity(packageName, eventTime, isKidModeLock)
+            launchLockActivity(packageName, eventTime, isKidModeLock, identifyMode)
         } else {
             showOverlay(packageName, eventTime)
         }
     }
 
-    private fun launchLockActivity(packageName: String, eventTime: Long, isKidModeLock: Boolean = false) {
+    private fun launchLockActivity(packageName: String, eventTime: Long, isKidModeLock: Boolean = false, identifyMode: Boolean = false) {
         if (activityLockActive && activityLockPackage == packageName) return
         activityLockActive = true
         activityLockPackage = packageName
@@ -643,8 +800,8 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
             val msgType = dataStoreManager.lockMessageType.first()
             withContext(Dispatchers.Main) {
                 try {
-                    startActivity(LockActivity.newIntent(this@AppLockForegroundService, packageName, msgType, isKidModeLock))
-                    Log.d("AppLock", "launchLockActivity pkg=$packageName eventTime=$eventTime kidMode=$isKidModeLock")
+                    startActivity(LockActivity.newIntent(this@AppLockForegroundService, packageName, msgType, isKidModeLock, identifyMode))
+                    Log.d("AppLock", "launchLockActivity pkg=$packageName eventTime=$eventTime kidMode=$isKidModeLock identify=$identifyMode")
                 } catch (e: Exception) {
                     Log.e("AppLock", "Failed to launch LockActivity", e)
                     activityLockActive = false
@@ -789,6 +946,54 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
                 description = "Notifies when a Free Play session starts or ends"
             }
         )
+        nm.createNotificationChannel(
+            NotificationChannel(NEW_APP_CHANNEL_ID, "New app alerts", NotificationManager.IMPORTANCE_DEFAULT).apply {
+                description = "Notifies when a new app is installed and auto-locked"
+            }
+        )
+    }
+
+    // Premium "Auto-lock new apps": lock a newly-installed user app and notify the parent.
+    private suspend fun handleNewAppInstalled(pkg: String) {
+        if (pkg == packageName) return
+        if (!dataStoreManager.autoBlockNewApps.first()) return
+        // Only user-facing apps (the same predicate that defines "an app worth controlling").
+        if (!com.shantanu.shield.util.AllowedApps.isControlledPackage(this, pkg)) return
+        val current = dataStoreManager.protectedApps.first()
+        if (pkg !in current) dataStoreManager.setProtectedApps(current + pkg)
+        postNewAppNotification(pkg)
+    }
+
+    private fun postNewAppNotification(pkg: String) {
+        val label = try {
+            packageManager.getApplicationLabel(packageManager.getApplicationInfo(pkg, 0)).toString()
+        } catch (e: Exception) { pkg }
+        val approve = PendingIntent.getService(
+            this, pkg.hashCode(),
+            Intent(this, AppLockForegroundService::class.java).apply {
+                action = ACTION_APPROVE_NEW_APP
+                putExtra(EXTRA_PACKAGE_NAME, pkg)
+            },
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        val open = PendingIntent.getActivity(
+            this, 0,
+            Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        val notification = NotificationCompat.Builder(this, NEW_APP_CHANNEL_ID)
+            .setSmallIcon(android.R.drawable.ic_lock_lock)
+            .setContentTitle("New app locked")
+            .setContentText("$label was installed and is locked until you allow it.")
+            .setContentIntent(open)
+            .addAction(0, "Allow", approve)
+            .setAutoCancel(true)
+            .build()
+        try {
+            getSystemService(NotificationManager::class.java).notify(pkg.hashCode(), notification)
+        } catch (e: SecurityException) {
+            Log.w("AppLock", "POST_NOTIFICATIONS not granted; skipping new-app notification")
+        }
     }
 
     private fun postFreePlayStartedNotification(durationMin: Int) {
@@ -962,6 +1167,16 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
                 intent.getBooleanExtra(EXTRA_AUTH_SUCCESS, false)
             )
         }
+        if (intent?.action == ACTION_APPROVE_NEW_APP) {
+            val pkg = intent.getStringExtra(EXTRA_PACKAGE_NAME)
+            if (pkg != null) {
+                serviceScope.launch {
+                    val current = dataStoreManager.protectedApps.first()
+                    if (pkg in current) dataStoreManager.setProtectedApps(current - pkg)
+                }
+                try { getSystemService(NotificationManager::class.java).cancel(pkg.hashCode()) } catch (e: Exception) {}
+            }
+        }
         return START_STICKY
     }
 
@@ -1002,6 +1217,7 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
     }
     override fun onDestroy() {
         super.onDestroy()
+        try { unregisterReceiver(packageAddedReceiver) } catch (e: Exception) {}
         monitorJob?.cancel()
         screenTimePollJob?.cancel()
         hideOverlay()

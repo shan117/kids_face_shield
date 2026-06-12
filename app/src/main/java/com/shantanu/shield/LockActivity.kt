@@ -30,12 +30,14 @@ class LockActivity : ComponentActivity() {
         lockedPackage = intent.getStringExtra(EXTRA_PACKAGE) ?: ""
         val messageType = intent.getIntExtra(EXTRA_MESSAGE_TYPE, 0)
         val isKidModeLock = intent.getBooleanExtra(EXTRA_KID_MODE_LOCK, false)
+        val identifyMode = intent.getBooleanExtra(EXTRA_IDENTIFY_MODE, false)
 
         setContent {
             FaceLockOverlayContent(
                 packageName = lockedPackage,
                 forcedMessageType = messageType,
                 isKidModeLock = isKidModeLock,
+                identifyMode = identifyMode,
                 onAuthenticated = {
                     resolved = true
                     reportResult(true)
@@ -87,12 +89,14 @@ class LockActivity : ComponentActivity() {
         const val EXTRA_PACKAGE = "lock_package"
         const val EXTRA_MESSAGE_TYPE = "lock_message_type"
         const val EXTRA_KID_MODE_LOCK = "lock_kid_mode"
+        const val EXTRA_IDENTIFY_MODE = "lock_identify_mode"
 
-        fun newIntent(context: Context, packageName: String, messageType: Int, isKidModeLock: Boolean = false): Intent {
+        fun newIntent(context: Context, packageName: String, messageType: Int, isKidModeLock: Boolean = false, identifyMode: Boolean = false): Intent {
             return Intent(context, LockActivity::class.java).apply {
                 putExtra(EXTRA_PACKAGE, packageName)
                 putExtra(EXTRA_MESSAGE_TYPE, messageType)
                 putExtra(EXTRA_KID_MODE_LOCK, isKidModeLock)
+                putExtra(EXTRA_IDENTIFY_MODE, identifyMode)
                 flags = Intent.FLAG_ACTIVITY_NEW_TASK or
                         Intent.FLAG_ACTIVITY_CLEAR_TASK or
                         Intent.FLAG_ACTIVITY_NO_ANIMATION

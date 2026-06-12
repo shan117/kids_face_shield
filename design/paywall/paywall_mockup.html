@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Paywall concept — Unlock the full Shield</title>
+<style>
+  :root{
+    --teal:#15A2BA; --teal-deep:#006072; --ink:#0c2a31; --cream:#FFF7EC;
+    --coral:#FF9E7A; --amber:#FFC24B; --muted:#5f7b82; --line:#e4eef0;
+  }
+  *{box-sizing:border-box; margin:0; padding:0;}
+  body{ background:#0f1115; min-height:100vh; display:flex; flex-direction:column;
+        align-items:center; gap:14px; padding:36px 16px;
+        font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif; color:#e8edf0;}
+  .cap{ color:#9aa6ad; font-size:13px; max-width:390px; text-align:center; line-height:1.5;}
+  .cap b{ color:#cfe8ee; }
+
+  /* phone frame */
+  .phone{ width:390px; max-width:100%; background:#ffffff; border-radius:38px; overflow:hidden;
+          box-shadow:0 30px 80px rgba(0,0,0,.55); color:var(--ink); position:relative;}
+  .scroll{ height:780px; overflow-y:auto; }
+
+  /* hero */
+  .hero{ background:linear-gradient(160deg,var(--teal),var(--teal-deep)); padding:18px 22px 30px;
+         text-align:center; position:relative; color:#fff;}
+  .topbar{ display:flex; justify-content:space-between; align-items:center; font-size:13px; opacity:.9;}
+  .topbar .x{ width:30px;height:30px;border-radius:50%;background:rgba(255,255,255,.16);
+              display:grid;place-items:center;font-size:16px;}
+  .restore{ color:#fff; opacity:.85; text-decoration:none; }
+  .glow{ width:170px;height:170px;margin:6px auto 4px; position:relative;}
+  .glow::before{ content:""; position:absolute; inset:-12px; border-radius:50%;
+                 background:radial-gradient(closest-side,rgba(255,255,255,.35),transparent 70%);}
+  .glow img{ width:100%; height:100%; position:relative; filter:drop-shadow(0 8px 18px rgba(0,0,0,.25)); }
+  .h1{ font-size:25px; font-weight:800; letter-spacing:-.3px; margin-top:4px;}
+  .sub{ font-size:14px; opacity:.92; margin-top:6px; }
+
+  /* body */
+  .body{ padding:20px 22px 26px; }
+  .pill{ display:inline-block; background:#fff4e0; color:#9a6b00; font-weight:700; font-size:11px;
+         letter-spacing:.04em; padding:5px 10px; border-radius:999px; }
+  .feat{ list-style:none; margin:14px 0 6px; }
+  .feat li{ display:flex; align-items:center; gap:12px; padding:9px 0; font-size:15px; font-weight:600;}
+  .check{ width:26px;height:26px;border-radius:50%;background:#e3f4f7;color:var(--teal-deep);
+          display:grid;place-items:center;flex:0 0 auto;font-weight:900;}
+  .ex{ font-size:11px;color:var(--muted); font-weight:600; }
+
+  /* plans */
+  .plans{ display:grid; grid-template-columns:1fr 1.15fr; gap:12px; margin:16px 0 6px;}
+  .plan{ border:2px solid var(--line); border-radius:18px; padding:14px; position:relative; cursor:pointer;}
+  .plan.sel{ border-color:var(--teal); background:#f4fbfc; box-shadow:0 6px 20px rgba(21,162,186,.15);}
+  .plan .label{ font-size:13px; color:var(--muted); font-weight:700;}
+  .plan .price{ font-size:23px; font-weight:850; margin-top:6px;}
+  .plan .price small{ font-size:13px; font-weight:600; color:var(--muted);}
+  .plan .was{ color:#b04a3a; text-decoration:line-through; font-size:13px; font-weight:700; margin-top:2px;}
+  .plan .billed{ font-size:12px; color:var(--muted); margin-top:4px;}
+  .badge{ position:absolute; top:-11px; left:50%; transform:translateX(-50%);
+          background:var(--teal); color:#fff; font-size:10.5px; font-weight:800; letter-spacing:.04em;
+          padding:4px 10px; border-radius:999px; white-space:nowrap;}
+  .radio{ width:18px;height:18px;border-radius:50%;border:2px solid #c7d3d6; position:absolute; top:12px; right:12px;}
+  .plan.sel .radio{ border-color:var(--teal); background:radial-gradient(closest-side,var(--teal) 55%,transparent 60%);}
+
+  /* trial timeline */
+  .timeline{ margin:18px 2px 6px; }
+  .tl-row{ display:flex; align-items:center; }
+  .dot{ width:14px;height:14px;border-radius:50%;background:var(--teal); flex:0 0 auto; position:relative; z-index:1;}
+  .dot.soft{ background:#bfe4eb;}
+  .bar{ height:3px; background:linear-gradient(90deg,var(--teal),#bfe4eb); flex:1; }
+  .tl-lab{ display:flex; justify-content:space-between; margin-top:7px; font-size:11.5px; color:var(--muted); font-weight:600;}
+  .tl-lab b{ color:var(--ink); display:block; font-size:12px;}
+
+  /* cta */
+  .cta{ margin-top:18px; width:100%; border:none; border-radius:16px; padding:17px;
+        background:linear-gradient(180deg,#17a9c2,var(--teal-deep)); color:#fff; font-size:17px; font-weight:800;
+        box-shadow:0 12px 26px rgba(0,96,114,.35); cursor:pointer;}
+  .cta-sub{ text-align:center; font-size:12.5px; color:var(--muted); margin-top:10px;}
+  .legal{ text-align:center; font-size:11px; color:#9fb0b5; margin-top:14px;}
+  .legal a{ color:#9fb0b5; }
+</style>
+</head>
+<body>
+  <div class="phone"><div class="scroll">
+    <div class="hero">
+      <div class="topbar"><div class="x">✕</div><a class="restore" href="#">Restore</a></div>
+      <div class="glow"><img src="../logos/lock_buddy_cam.svg" alt="Lock Buddy"/></div>
+      <div class="h1">Unlock the full Shield</div>
+      <div class="sub">Everything you need to keep them safe.</div>
+    </div>
+
+    <div class="body">
+      <span class="pill">★ PREMIUM</span>
+      <ul class="feat">
+        <li><span class="check">✓</span> Unlimited app locks</li>
+        <li><span class="check">✓</span> Multiple kid profiles</li>
+        <li><span class="check">✓</span> Full screen-time history &amp; trends</li>
+        <li><span class="check">✓</span> Night-lock &amp; smart budgets</li>
+      </ul>
+      <div class="ex">↑ example features — final “premium” list is yours to decide</div>
+
+      <div class="plans">
+        <div class="plan">
+          <span class="radio"></span>
+          <div class="label">Monthly</div>
+          <div class="price">₹199<small>/mo</small></div>
+          <div class="billed">billed monthly</div>
+        </div>
+        <div class="plan sel">
+          <span class="badge">BEST VALUE · SAVE 37%</span>
+          <span class="radio"></span>
+          <div class="label">Annual</div>
+          <div class="price">₹125<small>/mo</small></div>
+          <div class="was">₹199/mo</div>
+          <div class="billed">billed ₹1,499/year</div>
+        </div>
+      </div>
+
+      <div class="timeline">
+        <div class="tl-row">
+          <span class="dot"></span><span class="bar"></span>
+          <span class="dot soft"></span><span class="bar"></span>
+          <span class="dot soft"></span>
+        </div>
+        <div class="tl-lab">
+          <span><b>Today</b>Full access</span>
+          <span style="text-align:center"><b>Day 27</b>Reminder</span>
+          <span style="text-align:right"><b>Day 30</b>Billed</span>
+        </div>
+      </div>
+
+      <button class="cta">Start 30-day free trial</button>
+      <div class="cta-sub">Then ₹1,499/year · cancel anytime</div>
+      <div class="legal"><a href="#">Terms</a> · <a href="#">Privacy</a> · <a href="#">Restore purchase</a></div>
+    </div>
+  </div></div>
+
+  <div class="cap"><b>Concept mockup</b> — Annual + Monthly, 30-day free trial. The crossed-out ₹199 is the
+  <b>real monthly price</b> shown against the annual’s monthly-equivalent (honest, Play-compliant). Numbers are
+  placeholders; the real ones come from your Play Console at runtime.</div>
+</body>
+</html>

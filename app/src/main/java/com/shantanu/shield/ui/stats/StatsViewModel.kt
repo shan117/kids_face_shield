@@ -4,6 +4,7 @@ import android.content.Context
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.shantanu.shield.data.DataStoreManager
+import com.shantanu.shield.data.KidProfile
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.Dispatchers
@@ -53,6 +54,25 @@ data class StatsSnapshot(
     val insights: List<String> = emptyList()
 )
 
+/** One kid's week-at-a-glance figures, used by the Multiple-kids "Family" comparison. */
+data class KidWeek(
+    val id: String,
+    val name: String,
+    val color: Long,                    // avatarColor (ARGB)
+    val limitMin: Int,
+    val usedTodayMs: Long,              // persisted budget counter (matches the drill-down ring)
+    val week: List<DayBucket>,          // last 7 budget-days, oldest first, scoped to this kid
+    val topAppToday: AppUsageBucket?
+) {
+    val weekTotalMs: Long get() = week.sumOf { it.totalMs }
+    val dailyAvgMs: Long get() = if (week.isEmpty()) 0L else weekTotalMs / week.size
+    val budgetHitDays: Int get() =
+        if (limitMin <= 0) 0 else week.count { it.totalMs >= limitMin * 60_000L }
+    val busiestDayMs: Long? get() = week.filter { it.totalMs > 0L }.maxByOrNull { it.totalMs }?.dateMs
+}
+
+data class FamilyComparison(val loading: Boolean = true, val kids: List<KidWeek> = emptyList())
+
 @HiltViewModel
 class StatsViewModel @Inject constructor(
     @ApplicationContext private val context: Context,
@@ -65,6 +85,107 @@ class StatsViewModel @Inject constructor(
 
     private val _viewMode = MutableStateFlow(StatsViewMode.PARENT)
     val viewMode: StateFlow<StatsViewMode> = _viewMode.asStateFlow()
+
+    // ---- Multiple-kids dashboard (Phase 6) ----
+    // The dashboard switches to the per-kid view only when multi-kid is actually active
+    // (toggle on AND both kids enrolled) — matching the service's enforcement gate.
+    val multiKidActive = kotlinx.coroutines.flow.combine(
+        dataStoreManager.multiKidEnabled, dataStoreManager.kidFaceEmbeddings
+    ) { enabled, faces -> enabled && faces.size >= 2 }
+    val kidProfiles = dataStoreManager.kidProfiles
+
+    // Full per-kid snapshot for the Multiple-kids drill-down. Same shape — and therefore the same
+    // charts (budget ring, top apps, 7-day, 4-week trends, monthly average, insights) — as the
+    // single-kid dashboard, but every number is scoped to that kid's ProfileSessions.
+    private val _profileSnapshot = MutableStateFlow(StatsSnapshot(mode = StatsViewMode.KID))
+    val profileSnapshot: StateFlow<StatsSnapshot> = _profileSnapshot.asStateFlow()
+
+    // "Family" comparison across both kids (week totals, daily averages, busiest day, top app).
+    private val _family = MutableStateFlow(FamilyComparison())
+    val family: StateFlow<FamilyComparison> = _family.asStateFlow()
+
+    fun loadFamilyComparison() {
+        viewModelScope.launch {
+            _family.value = FamilyComparison(loading = true)
+            val profiles = kidProfiles.first()
+            val result = withContext(Dispatchers.IO) {
+                val include: (String) -> Boolean = {
+                    com.shantanu.shield.util.AllowedApps.isControlledPackage(context, it)
+                }
+                profiles.map { p ->
+                    val sessions = repo.profileSessionsFor(p.id)
+                    KidWeek(
+                        id = p.id,
+                        name = p.name,
+                        color = p.avatarColor,
+                        limitMin = p.dailyLimitMinutes,
+                        usedTodayMs = p.usedMs,
+                        week = repo.profileDailyTotals(sessions, 7, include),
+                        topAppToday = repo.profileUsageToday(sessions, include).firstOrNull()
+                    )
+                }
+            }
+            _family.value = FamilyComparison(loading = false, kids = result)
+        }
+    }
+
+    fun loadProfileSnapshot(profileId: String) {
+        viewModelScope.launch {
+            _profileSnapshot.value = StatsSnapshot(mode = StatsViewMode.KID, loading = true)
+            val profile = kidProfiles.first().firstOrNull { it.id == profileId }
+            if (profile == null) {
+                _profileSnapshot.value = StatsSnapshot(mode = StatsViewMode.KID, loading = false)
+                return@launch
+            }
+            _profileSnapshot.value = withContext(Dispatchers.IO) { computeProfileSnapshot(profile) }
+        }
+    }
+
+    private suspend fun computeProfileSnapshot(profile: KidProfile): StatsSnapshot {
+        // Per-kid uses the controlled-app set (the budget basis), identical to the single-kid view.
+        val include: (String) -> Boolean = {
+            com.shantanu.shield.util.AllowedApps.isControlledPackage(context, it)
+        }
+        val sessions = repo.profileSessionsFor(profile.id)
+
+        val todayAll = repo.profileUsageToday(sessions, include)
+        val topApps = todayAll.take(6)
+        // Total is over ALL of today's controlled apps (not just the top 6), so the vs-yesterday
+        // insight compares like-for-like with the all-apps yesterday total.
+        val todayTotal = todayAll.sumOf { it.foregroundMs }
+        val yesterdayTotal = repo.profileTotalForDay(sessions, 1, include)
+        val week = repo.profileDailyTotals(sessions, 7, include)
+        val weeklyAvgs = repo.profileWeeklyDailyAverages(sessions, 4, include)
+        val monthAvg = repo.profileMonthToDateAverage(sessions, include)
+        val trendDelta = computeTrendDelta(weeklyAvgs)
+
+        val budget = profile.dailyLimitMinutes * 60_000L
+        // The kid's persisted counters drive the budget ring + extension pill, exactly like the
+        // single-kid dashboard reads screen_time_used_ms / extensions_today_ms.
+        val budgetUsed = profile.usedMs
+        val extensions = profile.extensionsMs
+
+        val insights = buildInsights(
+            StatsViewMode.KID, todayTotal, yesterdayTotal, topApps, emptyList(),
+            budget, budgetUsed, week, weeklyAvgs, monthAvg, trendDelta
+        )
+
+        return StatsSnapshot(
+            mode = StatsViewMode.KID,
+            loading = false,
+            totalTodayMs = todayTotal,
+            totalYesterdayMs = yesterdayTotal,
+            budgetMs = budget,
+            budgetUsedMs = budgetUsed,
+            extensionsTodayMs = extensions,
+            kidTopApps = topApps,
+            week = week,
+            weeklyDailyAverages = weeklyAvgs,
+            monthToDateAvgMs = monthAvg,
+            trendDeltaPct = trendDelta,
+            insights = insights
+        )
+    }
 
     init {
         // Observe ownerType so the dashboard auto-flips between Parent and Kid views

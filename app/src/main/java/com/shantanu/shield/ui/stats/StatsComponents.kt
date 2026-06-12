@@ -8,6 +8,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
@@ -633,6 +634,162 @@ fun DailyAverageLine(avgMs: Long, labelOverride: String? = null) {
                 )
             }
         }
+    }
+}
+
+/** Grouped 7-day bars comparing two kids — each day slot holds two bars (kid 1, kid 2) scaled to
+ *  the shared max across both series, so the comparison is honest. */
+@Composable
+fun TwoKidWeekBars(
+    week1: List<DayBucket>,
+    week2: List<DayBucket>,
+    color1: Color,
+    color2: Color
+) {
+    val n = minOf(week1.size, week2.size)
+    if (n == 0) return
+    val max = (0 until n).maxOf { maxOf(week1[it].totalMs, week2[it].totalMs) }.coerceAtLeast(1L)
+    Column {
+        Row(
+            modifier = Modifier.fillMaxWidth().height(120.dp),
+            verticalAlignment = Alignment.Bottom,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            for (i in 0 until n) {
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    modifier = Modifier.weight(1f)
+                ) {
+                    val h1 = (week1[i].totalMs.toFloat() / max).coerceIn(0f, 1f) * 100f
+                    val h2 = (week2[i].totalMs.toFloat() / max).coerceIn(0f, 1f) * 100f
+                    Row(
+                        verticalAlignment = Alignment.Bottom,
+                        horizontalArrangement = Arrangement.spacedBy(3.dp)
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .width(10.dp)
+                                .height(h1.dp.coerceAtLeast(3.dp))
+                                .clip(RoundedCornerShape(topStart = 4.dp, topEnd = 4.dp))
+                                .background(color1)
+                        )
+                        Box(
+                            modifier = Modifier
+                                .width(10.dp)
+                                .height(h2.dp.coerceAtLeast(3.dp))
+                                .clip(RoundedCornerShape(topStart = 4.dp, topEnd = 4.dp))
+                                .background(color2)
+                        )
+                    }
+                }
+            }
+        }
+        Spacer(Modifier.height(6.dp))
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+            for (i in 0 until n) {
+                Text(
+                    text = dayLabel(n, i),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.weight(1f),
+                    textAlign = TextAlign.Center
+                )
+            }
+        }
+    }
+}
+
+/** One slice of a [ShareSplitBar]. */
+data class SplitSegment(val label: String, val value: Long, val color: Color)
+
+/** A single horizontal bar split proportionally by [segments] — "share of the total" at a glance,
+ *  with a labelled legend (name · %) underneath. */
+@Composable
+fun ShareSplitBar(segments: List<SplitSegment>) {
+    val total = segments.sumOf { it.value }
+    if (total <= 0L) {
+        Text(
+            "No activity this week yet.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.outline
+        )
+        return
+    }
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(16.dp)
+            .clip(RoundedCornerShape(8.dp))
+            .background(MaterialTheme.colorScheme.surfaceContainerHigh)
+    ) {
+        segments.forEach { seg ->
+            val frac = (seg.value.toFloat() / total).coerceIn(0f, 1f)
+            if (frac > 0f) {
+                Box(
+                    modifier = Modifier
+                        .weight(frac)
+                        .fillMaxHeight()
+                        .background(seg.color)
+                )
+            }
+        }
+    }
+    Spacer(Modifier.height(8.dp))
+    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+        segments.forEach { seg ->
+            val pct = (seg.value * 100 / total).toInt()
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Box(modifier = Modifier.size(10.dp).clip(CircleShape).background(seg.color))
+                Spacer(Modifier.width(6.dp))
+                Text(
+                    "${seg.label} · $pct%",
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    color = MaterialTheme.colorScheme.onSurface
+                )
+            }
+        }
+    }
+}
+
+/** Compact app row: icon + label + time, no progress bar. Used in comparison summaries. */
+@Composable
+fun TopAppLine(bucket: AppUsageBucket, modifier: Modifier = Modifier) {
+    Row(modifier = modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        val icon = bucket.icon
+        if (icon != null) {
+            Image(
+                bitmap = icon.toBitmap(width = 72, height = 72).asImageBitmap(),
+                contentDescription = null,
+                modifier = Modifier.size(28.dp).clip(RoundedCornerShape(8.dp))
+            )
+        } else {
+            Box(
+                modifier = Modifier
+                    .size(28.dp)
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(MaterialTheme.colorScheme.surfaceContainerHigh),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(Icons.Default.Star, null, modifier = Modifier.size(16.dp), tint = MaterialTheme.colorScheme.outline)
+            }
+        }
+        Spacer(Modifier.width(10.dp))
+        Text(
+            bucket.name,
+            style = MaterialTheme.typography.bodyMedium,
+            fontWeight = FontWeight.SemiBold,
+            color = MaterialTheme.colorScheme.onSurface,
+            maxLines = 1,
+            modifier = Modifier.weight(1f)
+        )
+        Spacer(Modifier.width(8.dp))
+        Text(
+            formatHm(bucket.foregroundMs),
+            style = MaterialTheme.typography.labelLarge,
+            fontWeight = FontWeight.Bold,
+            color = MaterialTheme.colorScheme.onSurface
+        )
     }
 }
 

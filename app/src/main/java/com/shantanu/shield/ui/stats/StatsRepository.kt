@@ -6,6 +6,7 @@ import android.content.pm.PackageManager
 import android.graphics.drawable.Drawable
 import com.shantanu.shield.data.DataStoreManager
 import com.shantanu.shield.data.FreePlayRecord
+import com.shantanu.shield.data.ProfileSession
 import kotlinx.coroutines.flow.first
 import java.util.Calendar
 import javax.inject.Inject
@@ -117,19 +118,23 @@ class StatsRepository @Inject constructor(
         return out
     }
 
+    /** Start-of-month timestamp (calendar midnight on the 1st), shared by the device-wide and
+     *  per-kid month-to-date averages. */
+    private fun monthStartMs(): Long = (Calendar.getInstance().clone() as Calendar).apply {
+        set(Calendar.DAY_OF_MONTH, 1)
+        set(Calendar.HOUR_OF_DAY, 0); set(Calendar.MINUTE, 0); set(Calendar.SECOND, 0); set(Calendar.MILLISECOND, 0)
+    }.timeInMillis
+
     /** Average daily screen time across the budget-days of the current calendar month. */
     fun monthToDateAverageMs(include: (String) -> Boolean = { controlled(it) }): Long {
-        val monthStartMs = (Calendar.getInstance().clone() as Calendar).apply {
-            set(Calendar.DAY_OF_MONTH, 1)
-            set(Calendar.HOUR_OF_DAY, 0); set(Calendar.MINUTE, 0); set(Calendar.SECOND, 0); set(Calendar.MILLISECOND, 0)
-        }.timeInMillis
+        val monthStart = monthStartMs()
         var total = 0L
         var days = 0
         var daysAgo = 0
         // Walk back budget-days while their start is still inside this calendar month.
         while (daysAgo <= 31) {
             val (s, e) = dayWindow(daysAgo)
-            if (s < monthStartMs) break
+            if (s < monthStart) break
             total += totalMsForWindow(s, e, include)
             days++
             daysAgo++
@@ -177,6 +182,117 @@ class StatsRepository @Inject constructor(
             .filter { it.value > 0L }
             .mapNotNull { (pkg, ms) -> resolveBucket(pkg, ms) }
             .sortedByDescending { it.foregroundMs }
+    }
+
+    // ---- Per-kid (Multiple-kids) usage ----
+    // Every per-kid number is the same window math the parent/kid views use, but intersected
+    // with that kid's ProfileSessions so it only counts time the kid was the identified user.
+
+    /** All recorded sessions for [profileId]. Fetched once and reused across the per-kid windows
+     *  (today / 7-day / 4-week / month) so we don't re-read DataStore for every window. */
+    suspend fun profileSessionsFor(profileId: String): List<ProfileSession> =
+        dataStoreManager.profileSessions.first().filter { it.profileId == profileId }
+
+    /** Per-app foreground time during the [sessions] that overlap [windowStart, windowEnd].
+     *  The shared primitive behind every per-kid figure: clip each session to the window, measure
+     *  controlled-app usage in the overlap (same UsageMeasure as the budget), merge by package. */
+    private fun profileUsageInWindow(
+        sessions: List<ProfileSession>,
+        windowStart: Long,
+        windowEnd: Long,
+        include: (String) -> Boolean
+    ): List<AppUsageBucket> {
+        val merged = mutableMapOf<String, Long>()
+        for (session in sessions) {
+            val s = maxOf(session.startMs, windowStart)
+            val e = minOf(session.endMs, windowEnd)
+            if (e <= s) continue
+            for (bucket in usageInWindow(s, e, include)) {
+                merged[bucket.packageName] = (merged[bucket.packageName] ?: 0L) + bucket.foregroundMs
+            }
+        }
+        return merged.entries
+            .filter { it.value > 0L }
+            .mapNotNull { (pkg, ms) -> resolveBucket(pkg, ms) }
+            .sortedByDescending { it.foregroundMs }
+    }
+
+    /** Top apps for [profileId] today (07:00 window). Convenience over [profileSessionsFor]. */
+    suspend fun profileUsageToday(
+        profileId: String,
+        include: (String) -> Boolean = { controlled(it) }
+    ): List<AppUsageBucket> = profileUsageToday(profileSessionsFor(profileId), include)
+
+    /** Top apps within today's window for already-fetched [sessions]. */
+    fun profileUsageToday(
+        sessions: List<ProfileSession>,
+        include: (String) -> Boolean = { controlled(it) }
+    ): List<AppUsageBucket> {
+        val (s, e) = todayWindow()
+        return profileUsageInWindow(sessions, s, e, include)
+    }
+
+    /** Total controlled-app ms for [sessions] within the budget-day [daysAgo] days back. */
+    fun profileTotalForDay(
+        sessions: List<ProfileSession>,
+        daysAgo: Int,
+        include: (String) -> Boolean = { controlled(it) }
+    ): Long {
+        val (s, e) = dayWindow(daysAgo)
+        return profileUsageInWindow(sessions, s, e, include).sumOf { it.foregroundMs }
+    }
+
+    /** Last [days] budget-days for [sessions], oldest first; index 0 = today. Free-Play ms is left
+     *  at 0 — Free Play is a device-level grant, not attributed to an individual kid. */
+    fun profileDailyTotals(
+        sessions: List<ProfileSession>,
+        days: Int,
+        include: (String) -> Boolean = { controlled(it) }
+    ): List<DayBucket> {
+        val out = ArrayList<DayBucket>(days)
+        for (i in (days - 1) downTo 0) {
+            val (s, e) = dayWindow(i)
+            out.add(DayBucket(s, profileUsageInWindow(sessions, s, e, include).sumOf { it.foregroundMs }, 0L))
+        }
+        return out
+    }
+
+    /** Daily averages for the last [weeks] weeks for [sessions]. Oldest first. */
+    fun profileWeeklyDailyAverages(
+        sessions: List<ProfileSession>,
+        weeks: Int = 4,
+        include: (String) -> Boolean = { controlled(it) }
+    ): List<Long> {
+        if (weeks <= 0) return emptyList()
+        val out = ArrayList<Long>(weeks)
+        for (w in (weeks - 1) downTo 0) {
+            var weekTotal = 0L
+            for (d in 0 until 7) {
+                val (s, e) = dayWindow(w * 7 + d)
+                weekTotal += profileUsageInWindow(sessions, s, e, include).sumOf { it.foregroundMs }
+            }
+            out.add(weekTotal / 7)
+        }
+        return out
+    }
+
+    /** Month-to-date daily average for [sessions] across the current calendar month. */
+    fun profileMonthToDateAverage(
+        sessions: List<ProfileSession>,
+        include: (String) -> Boolean = { controlled(it) }
+    ): Long {
+        val monthStart = monthStartMs()
+        var total = 0L
+        var days = 0
+        var daysAgo = 0
+        while (daysAgo <= 31) {
+            val (s, e) = dayWindow(daysAgo)
+            if (s < monthStart) break
+            total += profileUsageInWindow(sessions, s, e, include).sumOf { it.foregroundMs }
+            days++
+            daysAgo++
+        }
+        return if (days == 0) 0L else total / days
     }
 
     // Resolve a package's label + icon into a bucket. App-set filtering happens at the

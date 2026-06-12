@@ -45,6 +45,7 @@ fun FaceLockOverlayContent(
     packageName: String,
     forcedMessageType: Int,
     isKidModeLock: Boolean = false,
+    identifyMode: Boolean = false,
     onAuthenticated: () -> Unit
 ) {
     val context = LocalContext.current
@@ -58,6 +59,9 @@ fun FaceLockOverlayContent(
     var isBlocked by remember { mutableStateOf(false) }
     var showWarningAfterDelay by remember { mutableStateOf(false) }
     val matchStreak = remember { intArrayOf(0) }
+    // Multiple-kids identify state (only used when identifyMode = true).
+    val identifyStreak = remember { intArrayOf(0) }
+    val identifyCandidate = remember { arrayOf<String?>(null) }
     // Blink-based liveness state for this lock session.
     // A genuine human looking at the camera will, within a couple of seconds, naturally have one
     // frame where their eyes are clearly open AND a frame where they're clearly closed (a blink).
@@ -89,7 +93,7 @@ fun FaceLockOverlayContent(
         Log.d("AppLockOverlay", "Overlay composed for $packageName; starting 1500ms genuine-user window")
         delay(1500)
         Log.d("AppLockOverlay", "1500ms elapsed for $packageName; isBlocked=$isBlocked -> showWarningAfterDelay=${!isBlocked}")
-        if (!isBlocked) showWarningAfterDelay = true
+        if (!isBlocked && !identifyMode) showWarningAfterDelay = true
     }
 
     val finalShowWarning = isBlocked || showWarningAfterDelay
@@ -136,7 +140,9 @@ fun FaceLockOverlayContent(
                                         isAuthenticating = true
                                         coroutineScope.launch {
                                             val storedEmbedding = dataStoreManager.faceEmbedding.first()
-                                            if (storedEmbedding == null) { imageProxy.close(); isAuthenticating = false; return@launch }
+                                            // In identify mode the parent face is optional (kids unlock with their own
+                                            // face), so only bail on a missing parent embedding in the normal path.
+                                            if (!identifyMode && storedEmbedding == null) { imageProxy.close(); isAuthenticating = false; return@launch }
 
                                             val bitmap = ImageUtils.imageProxyToBitmap(imageProxy)
                                             imageProxy.close()
@@ -164,13 +170,45 @@ fun FaceLockOverlayContent(
                                                         Log.d("AppLockOverlay", "Eyes closed (prob=$eyeProb), skipping match for $packageName")
                                                     } else {
                                                         val currentEmbedding = faceRecognitionManager.getEmbedding(detected.bitmap)
-                                                        val matched = faceRecognitionManager.isMatch(currentEmbedding, storedEmbedding)
-                                                        if (matched) matchStreak[0]++ else matchStreak[0] = 0
                                                         val classificationDead = framesWithNullEyeProb[0] >= 30
                                                         val livenessOk = (livenessSeenOpen[0] && livenessSeenClosed[0]) || classificationDead
-                                                        Log.d("AppLockOverlay", "Face for $packageName matched=$matched streak=${matchStreak[0]} eyeProb=$eyeProb liveness=$livenessOk (open=${livenessSeenOpen[0]} closed=${livenessSeenClosed[0]} nullCnt=${framesWithNullEyeProb[0]})")
-                                                        if (matchStreak[0] >= REQUIRED_CONSECUTIVE_MATCHES && livenessOk) {
-                                                            onAuthenticated()
+                                                        if (identifyMode) {
+                                                            // Multiple-kids: identify WHICH kid is using the device, with a
+                                                            // parent override. Parent face → unlock; a confident kid match →
+                                                            // set the active profile, record a session, then allow (under
+                                                            // budget) or stay locked (over budget / night).
+                                                            val parentOk = storedEmbedding != null &&
+                                                                faceRecognitionManager.isMatch(currentEmbedding, storedEmbedding)
+                                                            if (parentOk) matchStreak[0]++ else matchStreak[0] = 0
+                                                            if (parentOk && matchStreak[0] >= REQUIRED_CONSECUTIVE_MATCHES && livenessOk) {
+                                                                onAuthenticated()
+                                                            } else {
+                                                                val gallery = dataStoreManager.kidFaceEmbeddings.first()
+                                                                val res = com.shantanu.shield.face.FaceMatcher.identify(currentEmbedding, gallery)
+                                                                val pid = res.profileId
+                                                                if (pid != null && pid == identifyCandidate[0]) identifyStreak[0]++
+                                                                else { identifyCandidate[0] = pid; identifyStreak[0] = if (pid != null) 1 else 0 }
+                                                                Log.d("AppLockOverlay", "Identify for $packageName -> $pid streak=${identifyStreak[0]} score=${res.score} runnerUp=${res.runnerUp}")
+                                                                if (pid != null && identifyStreak[0] >= REQUIRED_CONSECUTIVE_MATCHES && livenessOk) {
+                                                                    val nowMs = System.currentTimeMillis()
+                                                                    dataStoreManager.setActiveProfileId(pid)
+                                                                    dataStoreManager.appendProfileSession(
+                                                                        com.shantanu.shield.data.ProfileSession(pid, nowMs, nowMs)
+                                                                    )
+                                                                    val profile = dataStoreManager.kidProfiles.first().firstOrNull { it.id == pid }
+                                                                    val lock = profile != null && com.shantanu.shield.kid.MultiKidEnforcement.shouldLock(
+                                                                        profile.usedMs, profile.dailyLimitMinutes, profile.extensionsMs, isOverlayNightWindow(nowMs)
+                                                                    )
+                                                                    if (lock) isBlocked = true else onAuthenticated()
+                                                                }
+                                                            }
+                                                        } else {
+                                                            val matched = faceRecognitionManager.isMatch(currentEmbedding, storedEmbedding!!)
+                                                            if (matched) matchStreak[0]++ else matchStreak[0] = 0
+                                                            Log.d("AppLockOverlay", "Face for $packageName matched=$matched streak=${matchStreak[0]} eyeProb=$eyeProb liveness=$livenessOk")
+                                                            if (matchStreak[0] >= REQUIRED_CONSECUTIVE_MATCHES && livenessOk) {
+                                                                onAuthenticated()
+                                                            }
                                                         }
                                                     }
                                                 } else {
@@ -207,6 +245,14 @@ fun FaceLockOverlayContent(
             }
         }
     }
+}
+
+// Night-lock window for the overlay's identify decision: 22:00–06:59 (mirrors the service).
+private fun isOverlayNightWindow(nowMs: Long): Boolean {
+    val cal = java.util.Calendar.getInstance()
+    cal.timeInMillis = nowMs
+    val hour = cal.get(java.util.Calendar.HOUR_OF_DAY)
+    return hour >= 22 || hour < 7
 }
 
 @Composable

@@ -3,11 +3,15 @@ package com.shantanu.shield.ui.stats
 import android.content.Intent
 import android.provider.Settings
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.material3.FilterChip
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -37,6 +41,7 @@ import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -93,6 +98,14 @@ fun StatsScreen(viewModel: StatsViewModel = hiltViewModel()) {
             actionLabel = "Open Settings",
             onAction = { context.startActivity(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS)) }
         )
+        return
+    }
+
+    // Multiple-kids mode replaces the Parent/Kid switcher with a per-kid dashboard — but only once
+    // it's actually active (both kids enrolled). Otherwise the existing dashboard below is untouched.
+    val multiKid by viewModel.multiKidActive.collectAsState(initial = false)
+    if (multiKid) {
+        MultiKidDashboard(viewModel)
         return
     }
 
@@ -160,6 +173,273 @@ fun StatsScreen(viewModel: StatsViewModel = hiltViewModel()) {
             StatsViewMode.PARENT -> ParentDashboard(snapshot)
             StatsViewMode.KID -> KidDashboard(snapshot)
         }
+    }
+}
+
+@Composable
+private fun MultiKidDashboard(viewModel: StatsViewModel) {
+    val profiles by viewModel.kidProfiles.collectAsState(initial = emptyList())
+    val profileSnap by viewModel.profileSnapshot.collectAsState()
+    val family by viewModel.family.collectAsState()
+    var selectedId by remember { mutableStateOf<String?>(null) }
+
+    // Build the Family comparison on first entry; the per-kid drill-down loads on tap.
+    LaunchedEffect(Unit) { viewModel.loadFamilyComparison() }
+
+    val select: (String?) -> Unit = { id ->
+        selectedId = id
+        if (id != null) viewModel.loadProfileSnapshot(id) else viewModel.loadFamilyComparison()
+    }
+
+    Column(modifier = Modifier.fillMaxSize()) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 12.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            FilterChip(selected = selectedId == null, onClick = { select(null) }, label = { Text("Family") })
+            profiles.forEach { p ->
+                FilterChip(
+                    selected = selectedId == p.id,
+                    onClick = { select(p.id) },
+                    label = { Text(p.name) }
+                )
+            }
+        }
+        val sel = selectedId
+        if (sel == null) {
+            FamilyComparisonView(family, onSelect = { select(it) })
+        } else {
+            val profile = profiles.firstOrNull { it.id == sel }
+            if (profile == null || profileSnap.loading) {
+                Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    CircularProgressIndicator()
+                }
+            } else {
+                // The same rich dashboard the single-kid device shows — budget ring, top apps,
+                // 7-day chart, 4-week trends, monthly average, insights — scoped to this kid.
+                Column(modifier = Modifier.fillMaxSize()) {
+                    Text(
+                        profile.name,
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onSurface,
+                        modifier = Modifier.padding(start = 20.dp, end = 20.dp, bottom = 4.dp)
+                    )
+                    KidDashboard(profileSnap)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun FamilyComparisonView(family: FamilyComparison, onSelect: (String) -> Unit) {
+    if (family.loading) {
+        Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+            CircularProgressIndicator()
+        }
+        return
+    }
+    val kids = family.kids
+    LazyColumn(
+        modifier = Modifier.fillMaxSize(),
+        contentPadding = PaddingValues(start = 20.dp, end = 20.dp, top = 4.dp, bottom = 28.dp),
+        verticalArrangement = Arrangement.spacedBy(20.dp)
+    ) {
+        item { StatsSectionLabel("Today") }
+        item {
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                kids.forEach { k -> FamilyKidCard(k, onClick = { onSelect(k.id) }) }
+            }
+        }
+
+        // Cross-kid comparisons need exactly two kids (multi-kid is capped at 2).
+        if (kids.size >= 2) {
+            val k1 = kids[0]
+            val k2 = kids[1]
+            item { StatsSectionLabel("This week") }
+            item { WeekCompareCard(k1, k2) }
+            item { StatsSectionLabel("Week at a glance") }
+            item { GlanceCompareCard(k1, k2) }
+            item { StatsSectionLabel("Top app today") }
+            item { TopAppCompareCard(kids) }
+        }
+    }
+}
+
+@Composable
+private fun FamilyKidCard(k: KidWeek, onClick: () -> Unit) {
+    val usedMin = (k.usedTodayMs / 60_000L).toInt()
+    val over = usedMin >= k.limitMin
+    val progress = if (k.limitMin > 0) (usedMin.toFloat() / k.limitMin).coerceIn(0f, 1f) else 0f
+    val kidColor = Color(k.color)
+    val valueColor = if (over) MaterialTheme.colorScheme.error else kidColor
+    Card(
+        modifier = Modifier.fillMaxWidth().clickable(onClick = onClick),
+        shape = RoundedCornerShape(20.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer)
+    ) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                KidDot(kidColor)
+                Spacer(Modifier.width(10.dp))
+                Text(k.name, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                Text(
+                    "$usedMin / ${k.limitMin} min",
+                    color = valueColor,
+                    fontWeight = FontWeight.SemiBold
+                )
+            }
+            Spacer(Modifier.height(8.dp))
+            LinearProgressIndicator(
+                progress = { progress },
+                modifier = Modifier.fillMaxWidth().height(8.dp).clip(RoundedCornerShape(4.dp)),
+                color = valueColor,
+                trackColor = MaterialTheme.colorScheme.surfaceContainerHigh
+            )
+            Spacer(Modifier.height(6.dp))
+            val pct = if (k.limitMin > 0) (usedMin * 100 / k.limitMin) else 0
+            Text(
+                if (over) "Over budget" else "$pct% of budget used",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+    }
+}
+
+@Composable
+private fun WeekCompareCard(k1: KidWeek, k2: KidWeek) {
+    val c1 = Color(k1.color)
+    val c2 = Color(k2.color)
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(20.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer)
+    ) {
+        Column(modifier = Modifier.padding(20.dp)) {
+            Text("Screen time split", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Spacer(Modifier.height(12.dp))
+            ShareSplitBar(
+                listOf(
+                    SplitSegment(k1.name, k1.weekTotalMs, c1),
+                    SplitSegment(k2.name, k2.weekTotalMs, c2)
+                )
+            )
+            Spacer(Modifier.height(20.dp))
+            Text("Daily totals", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Spacer(Modifier.height(12.dp))
+            TwoKidWeekBars(k1.week, k2.week, c1, c2)
+            Spacer(Modifier.height(14.dp))
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+                LegendDot(c1, "${k1.name} · ${formatHm(k1.weekTotalMs)}")
+                LegendDot(c2, "${k2.name} · ${formatHm(k2.weekTotalMs)}")
+            }
+        }
+    }
+}
+
+@Composable
+private fun GlanceCompareCard(k1: KidWeek, k2: KidWeek) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(20.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer)
+    ) {
+        Column(modifier = Modifier.padding(20.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Spacer(Modifier.weight(1.2f))
+                CompareHeaderCell(k1)
+                CompareHeaderCell(k2)
+            }
+            Spacer(Modifier.height(12.dp))
+            CompareRow("Daily average", formatHm(k1.dailyAvgMs), formatHm(k2.dailyAvgMs))
+            CompareRow("Budget hit", "${k1.budgetHitDays}/${k1.week.size}", "${k2.budgetHitDays}/${k2.week.size}")
+            CompareRow("Busiest day", k1.busiestDayMs.weekdayOrDash(), k2.busiestDayMs.weekdayOrDash())
+        }
+    }
+}
+
+@Composable
+private fun RowScope.CompareHeaderCell(k: KidWeek) {
+    Row(
+        modifier = Modifier.weight(1f),
+        horizontalArrangement = Arrangement.End,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        KidDot(Color(k.color), size = 8.dp)
+        Spacer(Modifier.width(6.dp))
+        Text(k.name, style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface, maxLines = 1)
+    }
+}
+
+@Composable
+private fun CompareRow(label: String, v1: String, v2: String) {
+    Row(modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+        Text(label, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.weight(1.2f))
+        Text(v1, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurface, textAlign = TextAlign.End, modifier = Modifier.weight(1f))
+        Text(v2, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurface, textAlign = TextAlign.End, modifier = Modifier.weight(1f))
+    }
+}
+
+@Composable
+private fun TopAppCompareCard(kids: List<KidWeek>) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(20.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer)
+    ) {
+        Column(modifier = Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+            kids.forEach { k ->
+                Column {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        KidDot(Color(k.color))
+                        Spacer(Modifier.width(10.dp))
+                        Text(k.name, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface)
+                    }
+                    Spacer(Modifier.height(8.dp))
+                    val app = k.topAppToday
+                    if (app == null) {
+                        Text(
+                            "No activity yet today.",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(start = 22.dp)
+                        )
+                    } else {
+                        TopAppLine(app, modifier = Modifier.padding(start = 22.dp))
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun LegendDot(color: Color, text: String) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        KidDot(color)
+        Spacer(Modifier.width(8.dp))
+        Text(text, style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurface)
+    }
+}
+
+@Composable
+private fun KidDot(color: Color, size: androidx.compose.ui.unit.Dp = 12.dp) {
+    Box(modifier = Modifier.size(size).clip(CircleShape).background(color))
+}
+
+private fun Long?.weekdayOrDash(): String {
+    val ms = this ?: return "—"
+    val cal = java.util.Calendar.getInstance().apply { timeInMillis = ms }
+    return when (cal.get(java.util.Calendar.DAY_OF_WEEK)) {
+        java.util.Calendar.MONDAY -> "Mon"
+        java.util.Calendar.TUESDAY -> "Tue"
+        java.util.Calendar.WEDNESDAY -> "Wed"
+        java.util.Calendar.THURSDAY -> "Thu"
+        java.util.Calendar.FRIDAY -> "Fri"
+        java.util.Calendar.SATURDAY -> "Sat"
+        else -> "Sun"
     }
 }
 

@@ -10,6 +10,7 @@ import android.os.Bundle
 import android.provider.Settings
 import android.widget.Toast
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -86,7 +87,9 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
         startAppLockService()
         setContent {
-            AppShieldTheme {
+            val rootViewModel: MainViewModel = androidx.hilt.navigation.compose.hiltViewModel()
+            val accentKey by rootViewModel.themeAccent.collectAsState(initial = "teal")
+            AppShieldTheme(accent = com.shantanu.shield.ui.theme.AppAccent.fromKey(accentKey)) {
                 AppLockGate {
                     MainScreen()
                 }
@@ -718,103 +721,326 @@ private fun StatusBanner(viewModel: MainViewModel) {
     }
 }
 
+private enum class SettingsRoute { Hub, KidMode, MultiKid, Paywall, Tamper, Appearance, Permissions, Help }
+
 @Composable
 fun SettingsScreen(viewModel: MainViewModel) {
-    var showKidMode by remember { mutableStateOf(false) }
-    if (showKidMode) {
-        KidModeScreen(viewModel, onBack = { showKidMode = false })
-    } else {
-        SettingsList(viewModel, onKidModeClick = { showKidMode = true })
+    var route by remember { mutableStateOf(SettingsRoute.Hub) }
+    val coachMarks = com.shantanu.shield.ui.LocalCoachMarks.current
+    val requestTab = com.shantanu.shield.ui.LocalRequestTab.current
+    // Scope lives on SettingsScreen, which stays mounted across Hub<->detail
+    // navigation (only the inner `route` swaps) — so a delayed tour start here
+    // survives returning to the Hub.
+    val scope = rememberCoroutineScope()
+    val back: () -> Unit = { route = SettingsRoute.Hub }
+
+    when (route) {
+        SettingsRoute.KidMode -> KidModeScreen(viewModel, onBack = back)
+        SettingsRoute.MultiKid -> SettingsDetailScreen("Multiple Kids", onBack = back) {
+            com.shantanu.shield.ui.profiles.MultiKidSection(viewModel)
+        }
+        SettingsRoute.Paywall -> com.shantanu.shield.ui.paywall.PaywallScreen(onClose = back)
+        SettingsRoute.Tamper -> SettingsDetailScreen("Tamper Protection", onBack = back) {
+            TamperProtectionSection(viewModel)
+        }
+        SettingsRoute.Appearance -> SettingsDetailScreen("Appearance", onBack = back) {
+            AppearanceBody(viewModel)
+        }
+        SettingsRoute.Permissions -> SettingsDetailScreen("Permissions", onBack = back) {
+            PermissionDashboard()
+        }
+        SettingsRoute.Help -> SettingsDetailScreen("Help & Onboarding", onBack = back) {
+            HelpOnboardingSection(
+                viewModel = viewModel,
+                onReplayWelcomeTour = {
+                    // Re-arm + jump to Protect; MainScreen's effect starts the tour.
+                    viewModel.replayTour(com.shantanu.shield.ui.CoachTours.FIRST_RUN_ID)
+                    requestTab?.invoke(1)
+                },
+                onReplaySettingsTour = {
+                    // Return to the Hub (where the tour targets live), then start.
+                    route = SettingsRoute.Hub
+                    scope.launch {
+                        delay(450)
+                        coachMarks?.start(
+                            com.shantanu.shield.ui.CoachTours.SETTINGS_ID,
+                            com.shantanu.shield.ui.CoachTours.SETTINGS
+                        )
+                    }
+                }
+            )
+        }
+        SettingsRoute.Hub -> SettingsHub(
+            viewModel = viewModel,
+            onNavigate = { route = it },
+            onPlusClick = { route = SettingsRoute.Paywall }
+        )
     }
 }
 
+/**
+ * Settings "hub" — a short, scannable directory (WhatsApp/iOS style): a Plus hero,
+ * then grouped icon-rows that each drill into a focused detail screen. Replaces the
+ * old single long scroll so no one screen is overloaded; every feature is one tap away.
+ */
 @Composable
-private fun SettingsList(viewModel: MainViewModel, onKidModeClick: () -> Unit) {
-    val lockMessageType by viewModel.lockMessageType.collectAsState(initial = 0)
+private fun SettingsHub(
+    viewModel: MainViewModel,
+    onNavigate: (SettingsRoute) -> Unit,
+    onPlusClick: () -> Unit
+) {
+    val ownerType by viewModel.ownerType.collectAsState(initial = "parent")
     val scrollState = rememberScrollState()
     val coachMarks = com.shantanu.shield.ui.LocalCoachMarks.current
     val density = LocalDensity.current
 
-    val tamperStepIds = remember {
-        setOf("settings-tamper", "tamper-lock-settings", "tamper-protect-app", "tamper-prevent-uninstall")
-    }
-    val currentStepId = coachMarks?.steps?.getOrNull(coachMarks.currentIndex)?.id
-    val isTamperStep = coachMarks?.activeTourId == com.shantanu.shield.ui.CoachTours.SETTINGS_ID &&
-        currentStepId in tamperStepIds
-
+    // Keep the active Settings-tour target comfortably in view as steps advance.
     LaunchedEffect(coachMarks?.currentIndex, coachMarks?.activeTourId) {
         if (coachMarks?.activeTourId != com.shantanu.shield.ui.CoachTours.SETTINGS_ID) return@LaunchedEffect
         val step = coachMarks.steps.getOrNull(coachMarks.currentIndex) ?: return@LaunchedEffect
-        when {
-            step.id == "settings-security-foundation" -> {
-                scrollState.animateScrollTo(scrollState.maxValue)
-            }
-            step.id == "settings-kid-mode" || step.id == "settings-welcome" -> {
-                scrollState.animateScrollTo(0)
-            }
-            step.id in tamperStepIds -> {
-                // Wait for the expanded sub-cards to compose + lay out so the
-                // coach-target Rects are measured before we read them.
-                kotlinx.coroutines.delay(220)
-                val tid = step.targetId ?: return@LaunchedEffect
-                val targetTop = coachMarks.targets[tid]?.top ?: return@LaunchedEffect
-                val desiredTopPx = with(density) { 110.dp.toPx() }
-                val delta = (targetTop - desiredTopPx).toInt()
-                val newScroll = (scrollState.value + delta).coerceIn(0, scrollState.maxValue)
-                scrollState.animateScrollTo(newScroll)
-            }
+        val tid = step.targetId
+        if (tid == null) {
+            scrollState.animateScrollTo(0)
+            return@LaunchedEffect
         }
+        kotlinx.coroutines.delay(120)
+        val targetTop = coachMarks.targets[tid]?.top ?: return@LaunchedEffect
+        val desiredTopPx = with(density) { 140.dp.toPx() }
+        val delta = (targetTop - desiredTopPx).toInt()
+        val newScroll = (scrollState.value + delta).coerceIn(0, scrollState.maxValue)
+        scrollState.animateScrollTo(newScroll)
+    }
+
+    val kidSubtitle = if (ownerType == "kid")
+        "On — daily budget + night-time lock"
+    else
+        "Off — tap to set up budget & allowed apps"
+
+    val multiKidEnabled by viewModel.multiKidEnabled.collectAsState(initial = false)
+    val kidFaces by viewModel.kidFaceEmbeddings.collectAsState(initial = emptyMap())
+    val multiKidSubtitle = when {
+        multiKidEnabled && kidFaces.size >= 2 -> "On — each kid unlocks with their own face"
+        multiKidEnabled -> "On — enrol both kids' faces to activate"
+        else -> "Set up a shared phone for two kids"
     }
 
     Column(modifier = Modifier.fillMaxSize().verticalScroll(scrollState).padding(20.dp)) {
-        Text("System Customization", style = MaterialTheme.typography.titleLarge, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
-        Spacer(Modifier.height(16.dp))
+        com.shantanu.shield.ui.paywall.PlusEntryCard(onClick = onPlusClick)
+        Spacer(Modifier.height(28.dp))
 
+        SettingsSectionHeader("Protection")
+        Spacer(Modifier.height(12.dp))
         Box(modifier = Modifier.coachTarget("settings-kid-mode")) {
-            KidModeNavRow(viewModel, onClick = onKidModeClick)
+            SettingsHubRow(
+                icon = Icons.Default.Face,
+                title = "Kid Mode",
+                subtitle = kidSubtitle,
+                badge = "For your kid's own phone",
+                onClick = { onNavigate(SettingsRoute.KidMode) }
+            )
         }
-        Spacer(Modifier.height(24.dp))
+        Spacer(Modifier.height(12.dp))
+        Box(modifier = Modifier.coachTarget("settings-multikid")) {
+            SettingsHubRow(
+                icon = Icons.Default.Person,
+                title = "Multiple Kids",
+                subtitle = multiKidSubtitle,
+                badge = "Shared phone · 2 kids",
+                onClick = { onNavigate(SettingsRoute.MultiKid) }
+            )
+        }
+        Spacer(Modifier.height(12.dp))
+        Box(modifier = Modifier.coachTarget("settings-tamper")) {
+            SettingsHubRow(
+                icon = Icons.Default.Lock,
+                title = "Tamper Protection",
+                subtitle = "Lock settings, app & uninstall",
+                onClick = { onNavigate(SettingsRoute.Tamper) }
+            )
+        }
+        Spacer(Modifier.height(28.dp))
 
-        Column(modifier = Modifier.coachTarget("settings-intruder-style")) {
-            Text("Intruder Feedback Style", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.outline)
-            Card(
-                modifier = Modifier.fillMaxWidth().padding(vertical = 12.dp),
-                shape = RoundedCornerShape(24.dp),
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer)
+        SettingsSectionHeader("Personalization")
+        Spacer(Modifier.height(12.dp))
+        Box(modifier = Modifier.coachTarget("settings-appearance")) {
+            SettingsHubRow(
+                icon = Icons.Default.Star,
+                title = "Appearance",
+                subtitle = "Theme & intruder feedback style",
+                onClick = { onNavigate(SettingsRoute.Appearance) }
+            )
+        }
+        Spacer(Modifier.height(28.dp))
+
+        SettingsSectionHeader("Device & Help")
+        Spacer(Modifier.height(12.dp))
+        Box(modifier = Modifier.coachTarget("settings-permissions")) {
+            SettingsHubRow(
+                icon = Icons.Default.Settings,
+                title = "Permissions",
+                subtitle = "System access Kids Shield needs",
+                onClick = { onNavigate(SettingsRoute.Permissions) }
+            )
+        }
+        Spacer(Modifier.height(12.dp))
+        SettingsHubRow(
+            icon = Icons.Default.Info,
+            title = "Help & Onboarding",
+            subtitle = "Replay the guided tours",
+            onClick = { onNavigate(SettingsRoute.Help) }
+        )
+        Spacer(Modifier.height(8.dp))
+    }
+}
+
+/** One tappable directory row: leading icon chip, title, status subtitle, chevron. */
+@Composable
+private fun SettingsHubRow(
+    icon: ImageVector,
+    title: String,
+    subtitle: String,
+    badge: String? = null,
+    onClick: () -> Unit
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth().clickable(onClick = onClick),
+        shape = RoundedCornerShape(20.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer)
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(16.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(42.dp)
+                    .clip(CircleShape)
+                    .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.10f)),
+                contentAlignment = Alignment.Center
             ) {
-                Column(modifier = Modifier.padding(8.dp)) {
-                    StyleOption("Hardware Fault", "Simulate a broken module", lockMessageType == 0, Icons.Default.Warning) { viewModel.setLockMessageType(0) }
-                    StyleOption("Wellness Guide", "Polite eye health warning", lockMessageType == 1, Icons.Default.Favorite) { viewModel.setLockMessageType(1) }
-                    StyleOption("Spiritual Guide", "Shri Premanand Ji's advice", lockMessageType == 2, Icons.Default.AccountCircle) { viewModel.setLockMessageType(2) }
+                Icon(
+                    icon,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.size(22.dp)
+                )
+            }
+            Spacer(Modifier.width(16.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                Text(title, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                Spacer(Modifier.height(2.dp))
+                Text(subtitle, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.outline)
+                if (badge != null) {
+                    Spacer(Modifier.height(6.dp))
+                    // Highlighted hint pill — e.g. "for a phone that's the child's own".
+                    Surface(
+                        shape = RoundedCornerShape(8.dp),
+                        color = MaterialTheme.colorScheme.secondaryContainer
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(
+                                Icons.Default.Phone,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.onSecondaryContainer,
+                                modifier = Modifier.size(13.dp)
+                            )
+                            Spacer(Modifier.width(4.dp))
+                            Text(
+                                badge,
+                                style = MaterialTheme.typography.labelSmall,
+                                fontWeight = FontWeight.SemiBold,
+                                color = MaterialTheme.colorScheme.onSecondaryContainer
+                            )
+                        }
+                    }
                 }
             }
+            Icon(
+                Icons.AutoMirrored.Filled.KeyboardArrowRight,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.outline
+            )
         }
+    }
+}
 
-        Spacer(Modifier.height(24.dp))
-        Column(modifier = Modifier.coachTarget("settings-tamper")) {
-            TamperProtectionSection(viewModel, forceExpanded = isTamperStep)
-        }
+/** Small-caps group header — one consistent style for the whole hub. */
+@Composable
+private fun SettingsSectionHeader(text: String) {
+    Text(
+        text.uppercase(),
+        style = MaterialTheme.typography.labelMedium,
+        fontWeight = FontWeight.Bold,
+        color = MaterialTheme.colorScheme.primary,
+        letterSpacing = 0.8.sp
+    )
+}
 
-        Spacer(Modifier.height(24.dp))
-        HelpOnboardingSection(viewModel)
+/**
+ * Generic detail sub-screen: publishes its title + back action to the app's single
+ * top bar (same pattern as KidModeScreen) and hosts the supplied content in a scroll.
+ */
+@Composable
+private fun SettingsDetailScreen(
+    title: String,
+    onBack: () -> Unit,
+    content: @Composable () -> Unit
+) {
+    val topBarOverride = com.shantanu.shield.ui.LocalTopBarOverride.current
+    DisposableEffect(title) {
+        topBarOverride?.value = com.shantanu.shield.ui.TopBarOverride(title = title, onBack = onBack)
+        onDispose { topBarOverride?.value = null }
+    }
+    BackHandler(onBack = onBack)
+    Column(modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp)) {
+        content()
+    }
+}
 
+/** Appearance detail: accent Theme (Plus-gated, self-hides) + Intruder Feedback Style. */
+@Composable
+private fun AppearanceBody(viewModel: MainViewModel) {
+    val themesUnlocked by viewModel.themesUnlocked.collectAsState(initial = false)
+    if (themesUnlocked) {
+        com.shantanu.shield.ui.theme.ThemePickerSection(viewModel)
         Spacer(Modifier.height(24.dp))
-        Column(modifier = Modifier.coachTarget("settings-security-foundation")) {
-            PermissionDashboard()
+    }
+    IntruderFeedbackSection(viewModel)
+}
+
+/** The 3-way intruder feedback chooser (extracted from the old Settings list). */
+@Composable
+private fun IntruderFeedbackSection(viewModel: MainViewModel) {
+    val lockMessageType by viewModel.lockMessageType.collectAsState(initial = 0)
+    Text("Intruder Feedback Style", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+    Spacer(Modifier.height(4.dp))
+    Text(
+        "What a protected app shows when someone other than you tries to open it.",
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.outline
+    )
+    Card(
+        modifier = Modifier.fillMaxWidth().padding(vertical = 12.dp),
+        shape = RoundedCornerShape(24.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer)
+    ) {
+        Column(modifier = Modifier.padding(8.dp)) {
+            StyleOption("Hardware Fault", "Simulate a broken module", lockMessageType == 0, Icons.Default.Warning) { viewModel.setLockMessageType(0) }
+            StyleOption("Wellness Guide", "Polite eye health warning", lockMessageType == 1, Icons.Default.Favorite) { viewModel.setLockMessageType(1) }
+            StyleOption("Spiritual Guide", "Shri Premanand Ji's advice", lockMessageType == 2, Icons.Default.AccountCircle) { viewModel.setLockMessageType(2) }
         }
     }
 }
 
 @Composable
-private fun HelpOnboardingSection(viewModel: MainViewModel) {
-    val coachMarks = com.shantanu.shield.ui.LocalCoachMarks.current
-    val requestTab = com.shantanu.shield.ui.LocalRequestTab.current
-    val snackbar = LocalSnackbarHostState.current
-    val scope = rememberCoroutineScope()
-
-    Text("Help & Onboarding", style = MaterialTheme.typography.titleLarge, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
-    Spacer(Modifier.height(12.dp))
-
+private fun HelpOnboardingSection(
+    viewModel: MainViewModel,
+    onReplayWelcomeTour: () -> Unit,
+    onReplaySettingsTour: () -> Unit
+) {
     Card(
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(20.dp),
@@ -822,20 +1048,7 @@ private fun HelpOnboardingSection(viewModel: MainViewModel) {
     ) {
         Column {
             Surface(
-                onClick = {
-                    if (coachMarks == null) return@Surface
-                    viewModel.replayTour(com.shantanu.shield.ui.CoachTours.FIRST_RUN_ID)
-                    requestTab?.invoke(1)
-                    scope.launch {
-                        // Give the Protect tab a moment to compose so coach-mark targets
-                        // are positioned before the tour reads their bounds.
-                        kotlinx.coroutines.delay(400)
-                        coachMarks.start(
-                            com.shantanu.shield.ui.CoachTours.FIRST_RUN_ID,
-                            com.shantanu.shield.ui.CoachTours.FIRST_RUN
-                        )
-                    }
-                },
+                onClick = onReplayWelcomeTour,
                 color = MaterialTheme.colorScheme.surfaceContainer
             ) {
                 Row(
@@ -858,17 +1071,7 @@ private fun HelpOnboardingSection(viewModel: MainViewModel) {
             }
             HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
             Surface(
-                onClick = {
-                    if (coachMarks == null) return@Surface
-                    viewModel.replayTour(com.shantanu.shield.ui.CoachTours.SETTINGS_ID)
-                    scope.launch {
-                        kotlinx.coroutines.delay(300)
-                        coachMarks.start(
-                            com.shantanu.shield.ui.CoachTours.SETTINGS_ID,
-                            com.shantanu.shield.ui.CoachTours.SETTINGS
-                        )
-                    }
-                },
+                onClick = onReplaySettingsTour,
                 color = MaterialTheme.colorScheme.surfaceContainer
             ) {
                 Row(
@@ -881,7 +1084,7 @@ private fun HelpOnboardingSection(viewModel: MainViewModel) {
                         Text("Replay Settings tour", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
                         Spacer(Modifier.height(4.dp))
                         Text(
-                            "Re-explain Kid Mode, Intruder Feedback, Tamper Protection, Security Foundation.",
+                            "Re-explain Kid Mode, Tamper Protection, Appearance, and Permissions.",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.outline
                         )
@@ -889,42 +1092,6 @@ private fun HelpOnboardingSection(viewModel: MainViewModel) {
                     Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = null)
                 }
             }
-        }
-    }
-}
-
-@Composable
-private fun KidModeNavRow(viewModel: MainViewModel, onClick: () -> Unit) {
-    val ownerType by viewModel.ownerType.collectAsState(initial = "parent")
-    val isKidEnabled = ownerType == "kid"
-    Card(
-        modifier = Modifier.fillMaxWidth().clickable(onClick = onClick),
-        shape = RoundedCornerShape(20.dp),
-        colors = CardDefaults.cardColors(
-            containerColor = if (isKidEnabled)
-                MaterialTheme.colorScheme.primaryContainer
-            else
-                MaterialTheme.colorScheme.surfaceContainer
-        )
-    ) {
-        Row(
-            modifier = Modifier.fillMaxWidth().padding(16.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Icon(Icons.Default.AccountCircle, contentDescription = null, modifier = Modifier.size(28.dp))
-            Spacer(Modifier.width(16.dp))
-            Column(modifier = Modifier.weight(1f)) {
-                Text("Kid Mode", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
-                Text(
-                    if (isKidEnabled)
-                        "On — daily budget + night-time lock active"
-                    else
-                        "Off — tap to set up daily budget + allowed apps",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.outline
-                )
-            }
-            Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = null)
         }
     }
 }
@@ -1077,8 +1244,6 @@ fun TamperProtectionSection(viewModel: MainViewModel, forceExpanded: Boolean = f
     val maxCount = 3
     val simpleAllOn = lockDeviceSettings && lockOwnApp && faceEnrolled
 
-    Text("Tamper Protection", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
-    Spacer(Modifier.height(8.dp))
     Text(
         "Stop a child from uninstalling the app or changing its settings.",
         style = MaterialTheme.typography.bodySmall,
@@ -1396,7 +1561,11 @@ fun PermissionDashboard() {
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
-    Text("Security Foundation", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+    Text(
+        "Grant these so Kids Shield keeps protecting around the clock.",
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.outline
+    )
     Spacer(Modifier.height(12.dp))
 
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -2107,6 +2276,18 @@ private fun KidProtectBody(viewModel: MainViewModel) {
             extensionMin = (extensionsMs / 60_000L).toInt(),
             onGrant = { mins -> viewModel.grantExtension(mins) }
         )
+        Spacer(Modifier.height(16.dp))
+        com.shantanu.shield.ui.earn.EarnedTimeSection(viewModel)
+
+        Spacer(Modifier.height(16.dp))
+        com.shantanu.shield.ui.schedules.SchedulesSection(viewModel)
+
+        Spacer(Modifier.height(16.dp))
+        com.shantanu.shield.ui.perapp.PerAppLimitsSection(viewModel)
+
+        Spacer(Modifier.height(16.dp))
+        com.shantanu.shield.ui.newapp.NewAppBlockSection(viewModel)
+
         Spacer(Modifier.height(24.dp))
         Text(
             "Kid Mode is active. Non-allowed apps require parent face auth when the daily limit is over or during 22:00-07:00. Lock screen shows a kid-specific message about screen-time impact on eyes, brain, and concentration.",
@@ -2163,7 +2344,7 @@ private fun BudgetExtensionCard(extensionMin: Int, onGrant: (Int) -> Unit) {
 }
 
 @Composable
-private fun PresetOption(title: String, subtitle: String, selected: Boolean, onClick: () -> Unit) {
+internal fun PresetOption(title: String, subtitle: String, selected: Boolean, onClick: () -> Unit) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -2183,7 +2364,7 @@ private fun PresetOption(title: String, subtitle: String, selected: Boolean, onC
 }
 
 @Composable
-private fun AllowedAppRow(app: AppInfo, isAllowed: Boolean, onToggle: () -> Unit) {
+internal fun AllowedAppRow(app: AppInfo, isAllowed: Boolean, onToggle: () -> Unit) {
     Surface(
         onClick = onToggle,
         shape = RoundedCornerShape(14.dp),
@@ -2224,11 +2405,18 @@ private fun buildPresetBSubtitle(context: Context, phonePkg: String?, smsPkg: St
 }
 
 @Composable
-fun FaceEnrollmentScreen(viewModel: MainViewModel) {
+fun FaceEnrollmentScreen(
+    viewModel: MainViewModel,
+    title: String = "Face ID Registration",
+    isEnrolled: Boolean? = null,
+    onEmbedding: ((FloatArray) -> Unit)? = null
+) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
     val coroutineScope = rememberCoroutineScope()
     val faceEmbedding by viewModel.faceEmbedding.collectAsState(initial = null)
+    // Default to the parent enrolment state unless a caller (e.g. kid enrolment) overrides it.
+    val enrolled = isEnrolled ?: (faceEmbedding != null)
     val faceRecognitionManager = remember { FaceRecognitionManager(context) }
 
     var isEnrolling by remember { mutableStateOf(false) }
@@ -2237,7 +2425,7 @@ fun FaceEnrollmentScreen(viewModel: MainViewModel) {
     val cameraPermissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { if (it) isEnrolling = true }
 
     Column(modifier = Modifier.fillMaxSize().padding(20.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-        Text("Face ID Registration", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.ExtraBold)
+        Text(title, style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.ExtraBold)
         Spacer(Modifier.height(32.dp))
 
         Box(modifier = Modifier.size(280.dp).clip(CircleShape).background(MaterialTheme.colorScheme.surfaceVariant).shadow(10.dp, CircleShape), contentAlignment = Alignment.Center) {
@@ -2256,7 +2444,8 @@ fun FaceEnrollmentScreen(viewModel: MainViewModel) {
                                     if (bitmap != null) {
                                         val faceBitmap = faceRecognitionManager.detectFace(bitmap)
                                         if (faceBitmap != null) {
-                                            viewModel.saveFaceEmbedding(faceRecognitionManager.getEmbedding(faceBitmap))
+                                            val emb = faceRecognitionManager.getEmbedding(faceBitmap)
+                                            if (onEmbedding != null) onEmbedding(emb) else viewModel.saveFaceEmbedding(emb)
                                             isEnrolling = false
                                             enrollmentStatus = "Verified & Registered!"
                                         }
@@ -2270,13 +2459,13 @@ fun FaceEnrollmentScreen(viewModel: MainViewModel) {
                     previewView
                 }, modifier = Modifier.fillMaxSize())
             } else {
-                Icon(if (faceEmbedding != null) Icons.Default.CheckCircle else Icons.Default.AccountCircle, null, modifier = Modifier.size(100.dp), tint = if (faceEmbedding != null) Color(0xFF4CAF50) else MaterialTheme.colorScheme.primary)
+                Icon(if (enrolled) Icons.Default.CheckCircle else Icons.Default.AccountCircle, null, modifier = Modifier.size(100.dp), tint = if (enrolled) Color(0xFF4CAF50) else MaterialTheme.colorScheme.primary)
             }
         }
 
         Spacer(Modifier.height(48.dp))
         Button(onClick = { if (checkCameraPermission(context)) isEnrolling = true else cameraPermissionLauncher.launch(Manifest.permission.CAMERA) }, modifier = Modifier.fillMaxWidth().height(56.dp), shape = RoundedCornerShape(16.dp)) {
-            Text(if (faceEmbedding == null) "Setup Face ID" else "Update Biometrics", fontWeight = FontWeight.Bold)
+            Text(if (!enrolled) "Setup Face ID" else "Update Biometrics", fontWeight = FontWeight.Bold)
         }
         Text(enrollmentStatus, modifier = Modifier.padding(top = 16.dp), color = MaterialTheme.colorScheme.secondary, style = MaterialTheme.typography.bodySmall)
     }

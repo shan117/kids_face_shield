@@ -8,6 +8,9 @@ import android.graphics.drawable.Drawable
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.shantanu.shield.data.DataStoreManager
+import com.shantanu.shield.data.KidProfile
+import com.shantanu.shield.premium.EntitlementRepository
+import com.shantanu.shield.premium.Feature
 import com.shantanu.shield.util.AppCategorizer
 import com.shantanu.shield.util.AppCategory
 import dagger.hilt.android.lifecycle.HiltViewModel
@@ -23,6 +26,7 @@ import javax.inject.Inject
 @HiltViewModel
 class MainViewModel @Inject constructor(
     private val dataStoreManager: DataStoreManager,
+    private val entitlements: EntitlementRepository,
     @ApplicationContext private val context: Context
 ) : ViewModel() {
 
@@ -48,6 +52,43 @@ class MainViewModel @Inject constructor(
     val firstRunCompleted = dataStoreManager.firstRunCompleted
     val coachMarksEnabled = dataStoreManager.coachMarksEnabled
     val seenTours = dataStoreManager.seenTours
+
+    // ---- Multiple-kids profiles (Phase 4) ----
+    val multiKidEnabled = dataStoreManager.multiKidEnabled
+    val kidProfiles = dataStoreManager.kidProfiles
+    val kidFaceEmbeddings = dataStoreManager.kidFaceEmbeddings
+    val multiKidUnlocked = entitlements.isUnlocked(Feature.MULTI_KID_PROFILES)
+    /** profileId -> (package -> daily-limit minutes), for Multiple-kids per-app caps. */
+    val kidPerAppLimits = dataStoreManager.kidPerAppLimits
+
+    // ---- Earn screen-time (Phase 7) ----
+    val earnedTasks = dataStoreManager.earnedTasks
+    val earnedUnlocked = entitlements.isUnlocked(Feature.EARNED_TIME)
+
+    // ---- Schedules (Phase 7) ----
+    val schedules = dataStoreManager.schedules
+    val schedulesUnlocked = entitlements.isUnlocked(Feature.SCHEDULES)
+
+    // ---- Auto-lock new apps (Phase 7) ----
+    val autoBlockNewApps = dataStoreManager.autoBlockNewApps
+    val autoBlockUnlocked = entitlements.isUnlocked(Feature.NEW_APP_AUTO_BLOCK)
+    fun setAutoBlockNewApps(enabled: Boolean) {
+        viewModelScope.launch { dataStoreManager.setAutoBlockNewApps(enabled) }
+    }
+
+    // ---- Per-app limits (Phase 7) ----
+    val perAppLimits = dataStoreManager.perAppLimits
+    val perAppLimitsUnlocked = entitlements.isUnlocked(Feature.PER_APP_LIMITS)
+    fun setPerAppLimit(pkg: String, minutes: Int) {
+        viewModelScope.launch { dataStoreManager.setPerAppLimit(pkg, minutes) }
+    }
+
+    // ---- Theme accent (Phase 7) ----
+    val themeAccent = dataStoreManager.themeAccent
+    val themesUnlocked = entitlements.isUnlocked(Feature.THEMES)
+    fun setThemeAccent(key: String) {
+        viewModelScope.launch { dataStoreManager.setThemeAccent(key) }
+    }
 
     val filteredApps: StateFlow<List<AppInfo>> = combine(_installedApps, _searchQuery, protectedApps) { apps, query, protected ->
         val list = if (query.isBlank()) apps else apps.filter { it.name.contains(query, ignoreCase = true) }
@@ -180,6 +221,115 @@ class MainViewModel @Inject constructor(
     fun setDailyLimitMinutes(minutes: Int) { viewModelScope.launch { dataStoreManager.setDailyLimitMinutes(minutes) } }
     fun setAlwaysAllowedPreset(preset: Int) { viewModelScope.launch { dataStoreManager.setAlwaysAllowedPreset(preset) } }
     fun toggleCustomAlwaysAllowed(packageName: String) { viewModelScope.launch { dataStoreManager.toggleCustomAlwaysAllowed(packageName) } }
+
+    // ---- Multiple-kids profiles (Phase 4) ----
+    // Turning multi-kid on the first time migrates the current single-kid settings into "Kid 1"
+    // and seeds a "Kid 2" with the same defaults.
+    fun setMultiKidEnabled(on: Boolean) {
+        viewModelScope.launch {
+            if (on && dataStoreManager.kidProfiles.first().isEmpty()) {
+                val limit = dataStoreManager.dailyLimitMinutes.first()
+                val preset = dataStoreManager.alwaysAllowedPreset.first()
+                val custom = dataStoreManager.customAlwaysAllowed.first()
+                dataStoreManager.setKidProfiles(
+                    listOf(
+                        KidProfile("p1", "Kid 1", 0xFF006C7FL, limit, preset, custom),
+                        KidProfile("p2", "Kid 2", 0xFFFF9E7AL, limit, preset)
+                    )
+                )
+            }
+            dataStoreManager.setMultiKidEnabled(on)
+        }
+    }
+
+    fun setKidProfileName(id: String, name: String) {
+        viewModelScope.launch {
+            val updated = dataStoreManager.kidProfiles.first().map { if (it.id == id) it.copy(name = name) else it }
+            dataStoreManager.setKidProfiles(updated)
+        }
+    }
+
+    fun setKidProfileLimit(id: String, minutes: Int) {
+        viewModelScope.launch {
+            val updated = dataStoreManager.kidProfiles.first().map { if (it.id == id) it.copy(dailyLimitMinutes = minutes) else it }
+            dataStoreManager.setKidProfiles(updated)
+        }
+    }
+
+    fun setKidProfilePreset(id: String, preset: Int) {
+        viewModelScope.launch {
+            val updated = dataStoreManager.kidProfiles.first().map { if (it.id == id) it.copy(allowedPreset = preset) else it }
+            dataStoreManager.setKidProfiles(updated)
+        }
+    }
+
+    fun toggleKidProfileCustomAllowed(id: String, pkg: String) {
+        viewModelScope.launch {
+            val updated = dataStoreManager.kidProfiles.first().map {
+                if (it.id == id) {
+                    val cur = it.customAllowed
+                    it.copy(customAllowed = if (pkg in cur) cur - pkg else cur + pkg)
+                } else it
+            }
+            dataStoreManager.setKidProfiles(updated)
+        }
+    }
+
+    fun setKidProfilePerAppLimit(id: String, pkg: String, minutes: Int) {
+        viewModelScope.launch { dataStoreManager.setKidProfilePerAppLimit(id, pkg, minutes) }
+    }
+
+    fun saveKidFaceEmbedding(id: String, embedding: FloatArray) {
+        viewModelScope.launch { dataStoreManager.setKidFaceEmbedding(id, embedding) }
+    }
+
+    // ---- Earn screen-time (Phase 7) ----
+    fun addEarnedTask(title: String, minutes: Int) {
+        if (title.isBlank()) return
+        viewModelScope.launch {
+            val task = com.shantanu.shield.data.EarnedTask(
+                System.currentTimeMillis().toString(), title.trim(), minutes.coerceIn(1, 240)
+            )
+            dataStoreManager.setEarnedTasks(dataStoreManager.earnedTasks.first() + task)
+        }
+    }
+
+    fun removeEarnedTask(id: String) {
+        viewModelScope.launch {
+            dataStoreManager.setEarnedTasks(dataStoreManager.earnedTasks.first().filterNot { it.id == id })
+        }
+    }
+
+    // ---- Schedules (Phase 7) ----
+    // Save the CURRENT kid-mode config (limit + allowed apps) as a named, re-applyable schedule.
+    fun addSchedule(name: String) {
+        if (name.isBlank()) return
+        viewModelScope.launch {
+            val s = com.shantanu.shield.data.Schedule(
+                id = System.currentTimeMillis().toString(),
+                name = name.trim(),
+                dailyLimitMinutes = dataStoreManager.dailyLimitMinutes.first(),
+                allowedPreset = dataStoreManager.alwaysAllowedPreset.first(),
+                customAllowed = dataStoreManager.customAlwaysAllowed.first()
+            )
+            dataStoreManager.setSchedules(dataStoreManager.schedules.first() + s)
+        }
+    }
+
+    // Apply a schedule = write its values into the live kid-mode config.
+    fun applySchedule(schedule: com.shantanu.shield.data.Schedule) {
+        viewModelScope.launch {
+            dataStoreManager.setDailyLimitMinutes(schedule.dailyLimitMinutes)
+            dataStoreManager.setAlwaysAllowedPreset(schedule.allowedPreset)
+            dataStoreManager.setCustomAlwaysAllowed(schedule.customAllowed)
+        }
+    }
+
+    fun deleteSchedule(id: String) {
+        viewModelScope.launch {
+            dataStoreManager.setSchedules(dataStoreManager.schedules.first().filterNot { it.id == id })
+        }
+    }
 
     // Free-Play / Temp-Kid-Mode session: hand the phone to the kid for a fixed
     // window during which every app bypasses face-unlock (except the FaceShield
