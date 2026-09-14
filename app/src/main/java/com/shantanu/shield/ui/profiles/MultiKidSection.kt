@@ -32,6 +32,12 @@ import com.shantanu.shield.data.KidProfile
 @Composable
 fun MultiKidSection(viewModel: MainViewModel) {
     val unlocked by viewModel.multiKidUnlocked.collectAsState(initial = false)
+    com.shantanu.shield.ui.PremiumGate(unlocked, "Multiple kids") { MultiKidBody(viewModel) }
+}
+
+@Composable
+private fun MultiKidBody(viewModel: MainViewModel) {
+    val unlocked = true
     val enabled by viewModel.multiKidEnabled.collectAsState(initial = false)
     val profiles by viewModel.kidProfiles.collectAsState(initial = emptyList())
     val embeddings by viewModel.kidFaceEmbeddings.collectAsState(initial = emptyMap())

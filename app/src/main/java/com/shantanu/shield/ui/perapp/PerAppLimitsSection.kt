@@ -30,7 +30,11 @@ import com.shantanu.shield.MainViewModel
 @Composable
 fun PerAppLimitsSection(viewModel: MainViewModel) {
     val unlocked by viewModel.perAppLimitsUnlocked.collectAsState(initial = false)
-    if (!unlocked) return
+    com.shantanu.shield.ui.PremiumGate(unlocked, "Per-app limits") { PerAppLimitsBody(viewModel) }
+}
+
+@Composable
+private fun PerAppLimitsBody(viewModel: MainViewModel) {
     val limits by viewModel.perAppLimits.collectAsState(initial = emptyMap())
     val installedApps by viewModel.installedApps.collectAsState()
     var showDialog by remember { mutableStateOf(false) }

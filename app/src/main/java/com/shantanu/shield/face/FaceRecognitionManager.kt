@@ -22,10 +22,14 @@ import kotlin.math.sqrt
 class FaceRecognitionManager @Inject constructor(
     @ApplicationContext private val context: Context
 ) {
+    private val model = FaceModelConfig.active
     private var interpreter: Interpreter? = null
-    private var inputSize = 112 
-    private var outputSize = 128
+    private var inputSize = model.inputSize
+    private var outputSize = model.outputDim
     private val threshold = 0.6f
+
+    /** Model tag the embeddings this manager produces belong to (for stamping/version checks). */
+    val currentVersion: String get() = FaceModelConfig.CURRENT_FACE_MODEL_VERSION
 
     private val detector = FaceDetection.getClient(
         FaceDetectorOptions.Builder()
@@ -36,8 +40,8 @@ class FaceRecognitionManager @Inject constructor(
 
     init {
         try {
-            val model = FileUtil.loadMappedFile(context, "facenet.tflite")
-            interpreter = Interpreter(model)
+            val modelBuffer = FileUtil.loadMappedFile(context, model.assetName)
+            interpreter = Interpreter(modelBuffer)
             
             val inputShape = interpreter?.getInputTensor(0)?.shape()
             if (inputShape != null && inputShape.size >= 3) {
@@ -126,9 +130,11 @@ class FaceRecognitionManager @Inject constructor(
     fun getEmbedding(faceBitmap: Bitmap): FloatArray {
         val interp = interpreter ?: return FloatArray(outputSize)
 
+        // Config-driven preprocessing (Phase 2a). For FaceNet these are 112 + (x-127.5)/127.5, RGB —
+        // identical to before. TODO(2c): SFace needs swapRB (BGR) + its own normalization (see FaceModelConfig).
         val imageProcessor = ImageProcessor.Builder()
             .add(ResizeOp(inputSize, inputSize, ResizeOp.ResizeMethod.BILINEAR))
-            .add(NormalizeOp(127.5f, 127.5f))
+            .add(NormalizeOp(model.normMean, model.normStd))
             .build()
 
         val tensorImage = TensorImage(interp.getInputTensor(0).dataType())

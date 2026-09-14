@@ -8,8 +8,10 @@ import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.core.stringSetPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
+import com.shantanu.shield.face.FaceModelConfig
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.map
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -21,6 +23,8 @@ class DataStoreManager @Inject constructor(@ApplicationContext private val conte
 
     private val PROTECTED_APPS_KEY = stringSetPreferencesKey("protected_apps")
     private val FACE_EMBEDDING_KEY = stringPreferencesKey("face_embedding")
+    // SFace migration (Phase 1): which model the stored embeddings belong to. Stamped on every enrol.
+    private val FACE_MODEL_VERSION_KEY = stringPreferencesKey("face_model_version")
     private val LOCK_MESSAGE_TYPE_KEY = intPreferencesKey("lock_message_type")
     private val LOCK_DEVICE_SETTINGS_KEY = booleanPreferencesKey("lock_device_settings")
     private val LOCK_OWN_APP_KEY = booleanPreferencesKey("lock_own_app")
@@ -86,6 +90,25 @@ class DataStoreManager @Inject constructor(@ApplicationContext private val conte
     // ---- Theme accent (Phase 7) ----
     private val THEME_ACCENT_KEY = stringPreferencesKey("theme_accent")
 
+    // ---- Parent "not screen time" overrides ----
+    // Packages the PARENT has marked as not counting as screen time, from the parent dashboard.
+    // The final fallback for OEM utilities (wallpaper carousels, clocks) our rules didn't catch.
+    private val STATS_EXCLUDED_KEY = stringSetPreferencesKey("stats_excluded_packages")
+
+    // ---- Parent Remote Report (opt-in, E2E) — see PARENT_REMOTE_REPORT_PLAN.md ----
+    // role: "none" (default) / "child" (shares an encrypted weekly report) / "parent" (views it).
+    private val REMOTE_ROLE_KEY = stringPreferencesKey("remote_role")
+    // Hex bearer id (Firestore doc key) + hex AES-256 E2E key, both minted at pairing (PairingManager).
+    private val REMOTE_PAIRING_ID_KEY = stringPreferencesKey("remote_pairing_id")
+    private val REMOTE_PAIRING_KEY_KEY = stringPreferencesKey("remote_pairing_key")
+    // Opt-in master switch; while false, NOTHING leaves the device (the privacy invariant).
+    private val REMOTE_SHARE_ENABLED_KEY = booleanPreferencesKey("remote_share_enabled")
+    // How often the encrypted report syncs: "daily" or "weekly" (default).
+    private val REMOTE_SHARE_CADENCE_KEY = stringPreferencesKey("remote_share_cadence")
+    // Remote Control (parent→child commands): child opt-in + the last command id applied (idempotency).
+    private val REMOTE_CONTROL_ENABLED_KEY = booleanPreferencesKey("remote_control_enabled")
+    private val LAST_APPLIED_COMMAND_ID_KEY = stringPreferencesKey("last_applied_command_id")
+
     val protectedApps: Flow<Set<String>> = context.dataStore.data.map { preferences ->
         preferences[PROTECTED_APPS_KEY] ?: emptySet()
     }
@@ -95,6 +118,21 @@ class DataStoreManager @Inject constructor(@ApplicationContext private val conte
             string.split(",").map { it.toFloat() }.toFloatArray()
         }
     }
+
+    /** Model tag the stored embeddings belong to ("" = legacy, pre-versioning). */
+    val faceModelVersion: Flow<String> = context.dataStore.data.map { preferences ->
+        preferences[FACE_MODEL_VERSION_KEY] ?: ""
+    }
+
+    /**
+     * Stale-aware parent enrolment: enrolled AND the stored embedding belongs to the current model.
+     * On a model change (Phase 2c) old embeddings stop counting → re-enrol prompt. While on FaceNet,
+     * legacy unstamped embeddings still count (no behavior change in Phase 1).
+     */
+    val parentFaceEnrolled: Flow<Boolean> =
+        combine(faceEmbedding, faceModelVersion) { emb, ver ->
+            emb != null && FaceModelConfig.isVersionCurrent(ver)
+        }
 
     val lockMessageType: Flow<Int> = context.dataStore.data.map { preferences ->
         preferences[LOCK_MESSAGE_TYPE_KEY] ?: 0 // 0 for hardware, 1 for health
@@ -191,6 +229,15 @@ class DataStoreManager @Inject constructor(@ApplicationContext private val conte
         FaceGalleryCodec.decode(preferences[KID_FACE_EMBEDDINGS_KEY] ?: "")
     }
 
+    /** Stale-aware count of kid faces enrolled on the CURRENT model (0 if embeddings belong to an old model). */
+    val kidFacesEnrolledCount: Flow<Int> =
+        combine(kidFaceEmbeddings, faceModelVersion) { gallery, ver ->
+            if (FaceModelConfig.isVersionCurrent(ver)) gallery.size else 0
+        }
+
+    /** Stale-aware: at least [n] kid faces enrolled on the current model. */
+    fun kidFacesEnrolled(n: Int): Flow<Boolean> = kidFacesEnrolledCount.map { it >= n }
+
     val earnedTasks: Flow<List<EarnedTask>> = context.dataStore.data.map { preferences ->
         EarnedTaskCodec.decode(preferences[EARNED_TASKS_KEY] ?: "")
     }
@@ -241,10 +288,102 @@ class DataStoreManager @Inject constructor(@ApplicationContext private val conte
         context.dataStore.edit { preferences -> preferences[THEME_ACCENT_KEY] = key }
     }
 
+    // ---- Parent "not screen time" overrides ----
+
+    val statsExcludedPackages: Flow<Set<String>> = context.dataStore.data.map { preferences ->
+        preferences[STATS_EXCLUDED_KEY] ?: emptySet()
+    }
+
+    /** Mark [pkg] as not screen time ([excluded] true) or restore it to normal counting. */
+    suspend fun setStatsExcluded(pkg: String, excluded: Boolean) {
+        context.dataStore.edit { preferences ->
+            val current = (preferences[STATS_EXCLUDED_KEY] ?: emptySet()).toMutableSet()
+            if (excluded) current.add(pkg) else current.remove(pkg)
+            preferences[STATS_EXCLUDED_KEY] = current
+        }
+    }
+
+    // ---- Parent Remote Report flows + setters (opt-in, E2E) ----
+    val remoteRole: Flow<String> = context.dataStore.data.map { preferences ->
+        preferences[REMOTE_ROLE_KEY] ?: "none"
+    }
+
+    val remotePairingId: Flow<String> = context.dataStore.data.map { preferences ->
+        preferences[REMOTE_PAIRING_ID_KEY] ?: ""
+    }
+
+    val remotePairingKey: Flow<String> = context.dataStore.data.map { preferences ->
+        preferences[REMOTE_PAIRING_KEY_KEY] ?: ""
+    }
+
+    val remoteShareEnabled: Flow<Boolean> = context.dataStore.data.map { preferences ->
+        preferences[REMOTE_SHARE_ENABLED_KEY] ?: false
+    }
+
+    val remoteShareCadence: Flow<String> = context.dataStore.data.map { preferences ->
+        preferences[REMOTE_SHARE_CADENCE_KEY] ?: "weekly"
+    }
+
+    suspend fun setRemoteShareCadence(cadence: String) {
+        context.dataStore.edit { preferences -> preferences[REMOTE_SHARE_CADENCE_KEY] = cadence }
+    }
+
+    suspend fun setRemoteRole(role: String) {
+        context.dataStore.edit { preferences -> preferences[REMOTE_ROLE_KEY] = role }
+    }
+
+    /** Store the paired id + key together — they are minted and exchanged as a single unit. */
+    suspend fun setRemotePairing(pairingIdHex: String, pairingKeyHex: String) {
+        context.dataStore.edit { preferences ->
+            preferences[REMOTE_PAIRING_ID_KEY] = pairingIdHex
+            preferences[REMOTE_PAIRING_KEY_KEY] = pairingKeyHex
+        }
+    }
+
+    suspend fun setRemoteShareEnabled(enabled: Boolean) {
+        context.dataStore.edit { preferences -> preferences[REMOTE_SHARE_ENABLED_KEY] = enabled }
+    }
+
+    /** Unpair / revoke: wipe the pairing secrets, role, share + control flags in one atomic edit. */
+    suspend fun clearRemotePairing() {
+        context.dataStore.edit { preferences ->
+            preferences.remove(REMOTE_PAIRING_ID_KEY)
+            preferences.remove(REMOTE_PAIRING_KEY_KEY)
+            preferences.remove(REMOTE_ROLE_KEY)
+            preferences.remove(REMOTE_SHARE_ENABLED_KEY)
+            preferences.remove(REMOTE_CONTROL_ENABLED_KEY)
+            preferences.remove(LAST_APPLIED_COMMAND_ID_KEY)
+        }
+    }
+
+    // ---- Remote Control (parent→child commands) flows + setters ----
+    val remoteControlEnabled: Flow<Boolean> = context.dataStore.data.map { preferences ->
+        preferences[REMOTE_CONTROL_ENABLED_KEY] ?: false
+    }
+
+    val lastAppliedCommandId: Flow<String> = context.dataStore.data.map { preferences ->
+        preferences[LAST_APPLIED_COMMAND_ID_KEY] ?: ""
+    }
+
+    suspend fun setRemoteControlEnabled(enabled: Boolean) {
+        context.dataStore.edit { preferences -> preferences[REMOTE_CONTROL_ENABLED_KEY] = enabled }
+    }
+
+    suspend fun setLastAppliedCommandId(id: String) {
+        context.dataStore.edit { preferences -> preferences[LAST_APPLIED_COMMAND_ID_KEY] = id }
+    }
+
     suspend fun saveFaceEmbedding(embedding: FloatArray) {
         context.dataStore.edit { preferences ->
             preferences[FACE_EMBEDDING_KEY] = embedding.joinToString(",")
+            // Stamp the model this embedding was produced with, so a future model change invalidates it.
+            preferences[FACE_MODEL_VERSION_KEY] = FaceModelConfig.CURRENT_FACE_MODEL_VERSION
         }
+    }
+
+    /** Set/clear the model tag for the stored embeddings (used by the migration to force re-enrol). */
+    suspend fun setFaceModelVersion(version: String) {
+        context.dataStore.edit { preferences -> preferences[FACE_MODEL_VERSION_KEY] = version }
     }
 
     suspend fun setLockMessageType(type: Int) {
@@ -327,6 +466,18 @@ class DataStoreManager @Inject constructor(@ApplicationContext private val conte
         }
     }
 
+    /** Zero every kid profile's granted extension — called at the daily 07:00 boundary so a per-profile
+     *  grant (multi-kid) doesn't carry into the next day. Per-profile usedMs isn't reset here: it's
+     *  recomputed from windowed sessions each poll, so it's already day-scoped. */
+    suspend fun resetAllProfileExtensions() {
+        context.dataStore.edit { preferences ->
+            val current = KidProfileCodec.decode(preferences[KID_PROFILES_KEY] ?: "")
+            if (current.isEmpty()) return@edit
+            val updated = current.map { if (it.extensionsMs != 0L) it.copy(extensionsMs = 0L) else it }
+            if (updated != current) preferences[KID_PROFILES_KEY] = KidProfileCodec.encode(updated)
+        }
+    }
+
     suspend fun setScreenTimeLastResetDate(date: String) {
         context.dataStore.edit { preferences ->
             preferences[SCREEN_TIME_LAST_RESET_DATE_KEY] = date
@@ -348,12 +499,30 @@ class DataStoreManager @Inject constructor(@ApplicationContext private val conte
     suspend fun addExtensionMinutes(minutes: Int) {
         if (minutes <= 0) return
         context.dataStore.edit { preferences ->
+            val addMs = minutes * 60_000L
             val current = preferences[EXTENSIONS_TODAY_MS_KEY] ?: 0L
-            preferences[EXTENSIONS_TODAY_MS_KEY] = current + minutes * 60_000L
+            preferences[EXTENSIONS_TODAY_MS_KEY] = current + addMs
             val existing = preferences[EXTENSION_HISTORY_KEY] ?: ""
             val entry = "${System.currentTimeMillis()},$minutes"
             preferences[EXTENSION_HISTORY_KEY] =
                 if (existing.isEmpty()) entry else "$existing;$entry"
+
+            // Multi-kid: enforcement reads the PER-PROFILE extension (KidProfile.extensionsMs), not the
+            // global counter above — so a grant must also bump the locked kid's profile or it stays locked.
+            // Target the most-recent session's profile (the kid who was last using the phone = the locked
+            // one); the global bump alone only frees single-kid mode.
+            if (preferences[MULTI_KID_ENABLED_KEY] == true) {
+                val sessions = KidProfileCodec.decodeSessions(preferences[PROFILE_SESSIONS_KEY] ?: "")
+                val targetId = sessions.maxByOrNull { it.endMs }?.profileId
+                if (targetId != null) {
+                    val profiles = KidProfileCodec.decode(preferences[KID_PROFILES_KEY] ?: "")
+                    if (profiles.any { it.id == targetId }) {
+                        preferences[KID_PROFILES_KEY] = KidProfileCodec.encode(
+                            profiles.map { if (it.id == targetId) it.copy(extensionsMs = it.extensionsMs + addMs) else it }
+                        )
+                    }
+                }
+            }
         }
     }
 
@@ -378,6 +547,13 @@ class DataStoreManager @Inject constructor(@ApplicationContext private val conte
     suspend fun markTourSeen(tourId: String) {
         context.dataStore.edit { preferences ->
             preferences[SEEN_TOURS_KEY] = (preferences[SEEN_TOURS_KEY] ?: emptySet()) + tourId
+        }
+    }
+
+    /** Re-arm a single tour, leaving the others marked seen. */
+    suspend fun unmarkTourSeen(tourId: String) {
+        context.dataStore.edit { preferences ->
+            preferences[SEEN_TOURS_KEY] = (preferences[SEEN_TOURS_KEY] ?: emptySet()) - tourId
         }
     }
 
@@ -431,6 +607,20 @@ class DataStoreManager @Inject constructor(@ApplicationContext private val conte
         context.dataStore.edit { preferences -> preferences[ACTIVE_PROFILE_ID_KEY] = id }
     }
 
+    /**
+     * Atomically update ONLY each profile's usedMs (by id), re-reading the current profile list inside
+     * the edit. Used by the per-profile usage poll so it can't clobber a concurrent extension grant
+     * (extensionsMs) / limit change — it touches usedMs and nothing else.
+     */
+    suspend fun updateProfileUsedMs(usedById: Map<String, Long>) {
+        context.dataStore.edit { preferences ->
+            val current = KidProfileCodec.decode(preferences[KID_PROFILES_KEY] ?: "")
+            if (current.isEmpty()) return@edit
+            val updated = current.map { p -> usedById[p.id]?.let { p.copy(usedMs = it) } ?: p }
+            if (updated != current) preferences[KID_PROFILES_KEY] = KidProfileCodec.encode(updated)
+        }
+    }
+
     // Append a profile session for usage attribution, pruning entries older than the history window.
     suspend fun appendProfileSession(session: ProfileSession) {
         context.dataStore.edit { preferences ->
@@ -461,6 +651,8 @@ class DataStoreManager @Inject constructor(@ApplicationContext private val conte
             val current = FaceGalleryCodec.decode(preferences[KID_FACE_EMBEDDINGS_KEY] ?: "").toMutableMap()
             current[profileId] = embedding
             preferences[KID_FACE_EMBEDDINGS_KEY] = FaceGalleryCodec.encode(current)
+            // Same model stamp as the parent — a single global version covers all embeddings.
+            preferences[FACE_MODEL_VERSION_KEY] = FaceModelConfig.CURRENT_FACE_MODEL_VERSION
         }
     }
 

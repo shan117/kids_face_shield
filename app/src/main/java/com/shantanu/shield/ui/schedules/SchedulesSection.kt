@@ -22,8 +22,11 @@ import kotlinx.coroutines.launch
 @Composable
 fun SchedulesSection(viewModel: MainViewModel) {
     val unlocked by viewModel.schedulesUnlocked.collectAsState(initial = false)
-    if (!unlocked) return
+    com.shantanu.shield.ui.PremiumGate(unlocked, "Schedules") { SchedulesBody(viewModel) }
+}
 
+@Composable
+private fun SchedulesBody(viewModel: MainViewModel) {
     val schedules by viewModel.schedules.collectAsState(initial = emptyList())
     val snackbar = LocalSnackbarHostState.current
     val scope = rememberCoroutineScope()

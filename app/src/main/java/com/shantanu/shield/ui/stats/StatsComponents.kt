@@ -2,7 +2,9 @@ package com.shantanu.shield.ui.stats
 
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -22,8 +24,10 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
+import androidx.compose.material3.IconButton
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
@@ -104,17 +108,28 @@ fun HeroMetricCard(
     }
 }
 
-/** Top-N app list row: icon + name + horizontal bar + minutes + percentage of total. */
+/** Top-N app list row: icon + name + horizontal bar + minutes + percentage of total.
+ *  [onLongPress] is supplied only by the PARENT dashboard, where long-pressing a row offers
+ *  "not screen time" — the parent's override for OEM utilities our rules didn't catch. */
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun AppBarRow(
     bucket: AppUsageBucket,
     maxMs: Long,
-    barColor: Color = MaterialTheme.colorScheme.primary
+    barColor: Color = MaterialTheme.colorScheme.primary,
+    onLongPress: (() -> Unit)? = null
 ) {
     val fraction = if (maxMs <= 0) 0f else (bucket.foregroundMs.toFloat() / maxMs).coerceIn(0f, 1f)
     val pct = (fraction * 100).toInt()
     Row(
-        modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp),
+        modifier = Modifier
+            .fillMaxWidth()
+            .then(
+                if (onLongPress != null) {
+                    Modifier.combinedClickable(onClick = {}, onLongClick = onLongPress)
+                } else Modifier
+            )
+            .padding(vertical = 6.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
         val icon = bucket.icon
@@ -180,6 +195,19 @@ fun AppBarRow(
             fontWeight = FontWeight.Bold,
             color = MaterialTheme.colorScheme.onSurface
         )
+        // Visible affordance for the same action as the long-press. A long-press alone is
+        // undiscoverable, and TalkBack users cannot reach it at all — this button is the real
+        // entry point; the gesture is just a shortcut for people who find it.
+        if (onLongPress != null) {
+            IconButton(onClick = onLongPress, modifier = Modifier.size(32.dp)) {
+                Icon(
+                    Icons.Default.MoreVert,
+                    contentDescription = "Options for ${bucket.name}",
+                    modifier = Modifier.size(18.dp),
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        }
     }
 }
 

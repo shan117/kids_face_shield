@@ -73,6 +73,71 @@ class AllowedAppsTest {
         assertTrue(AllowedApps.isParentVisible("com.instagram.android", self, isSystemApp = false, isUpdatedSystemApp = false))
     }
 
+    // ---- Non-screen-time utilities (Clock, wallpaper carousel) ----
+
+    @Test
+    fun `clock is hidden from both views on every OEM`() {
+        // Google Clock is a system app updated from the Play Store — the case that leaked into
+        // the parent dashboard before isNonScreenTime existed.
+        assertFalse(AllowedApps.isParentVisible("com.google.android.deskclock", self, isSystemApp = true, isUpdatedSystemApp = true))
+        assertFalse(AllowedApps.isControlled("com.google.android.deskclock", self, isSystemApp = true))
+        // OEM clocks, explicit + name-matched.
+        assertFalse(AllowedApps.isParentVisible("com.coloros.alarmclock", self, isSystemApp = true, isUpdatedSystemApp = false))
+        assertFalse(AllowedApps.isParentVisible("com.sec.android.app.clockpackage", self, isSystemApp = true, isUpdatedSystemApp = true))
+        assertFalse(AllowedApps.isParentVisible("com.someoem.deskclock", self, isSystemApp = true, isUpdatedSystemApp = false))
+    }
+
+    @Test
+    fun `wallpaper carousel is hidden from both views`() {
+        // Realme/Oppo lock-screen wallpaper carousel — foreground on every lock-screen swipe.
+        assertFalse(AllowedApps.isParentVisible("com.heytap.pictorial", self, isSystemApp = true, isUpdatedSystemApp = true))
+        assertFalse(AllowedApps.isControlled("com.heytap.pictorial", self, isSystemApp = true))
+        assertFalse(AllowedApps.isParentVisible("com.google.android.apps.wallpaper", self, isSystemApp = true, isUpdatedSystemApp = true))
+        assertFalse(AllowedApps.isParentVisible("com.mfashiongallery.emag", self, isSystemApp = true, isUpdatedSystemApp = false))
+    }
+
+    @Test
+    fun `carousel packages are hidden across OEMs`() {
+        val carousels = listOf(
+            "com.heytap.pictorial",              // Realme / Oppo
+            "com.oplus.pictorial",
+            "com.coloros.pictorial",
+            "com.mfashiongallery.emag",          // MIUI / HyperOS
+            "com.miui.android.fashiongallery",
+            "com.glance.internet",               // Glance
+            "com.samsung.android.app.dressroom", // Samsung
+            "com.vivo.magazine",                 // vivo
+            "com.motorola.personalize",          // Motorola
+            "com.transsion.magazineservice",     // Tecno / Infinix / itel
+        )
+        for (pkg in carousels) {
+            assertFalse("$pkg should not be screen time",
+                AllowedApps.isParentVisible(pkg, self, isSystemApp = true, isUpdatedSystemApp = true))
+            assertFalse("$pkg should not count toward the budget",
+                AllowedApps.isControlled(pkg, self, isSystemApp = true))
+        }
+    }
+
+    @Test
+    fun `an explicit time-sink beats the name heuristic`() {
+        // Google News is com.google.android.apps.magazines — the "magazine" hint must not hide it.
+        assertTrue(AllowedApps.isParentVisible("com.google.android.apps.magazines", self, isSystemApp = true, isUpdatedSystemApp = true))
+        assertTrue(AllowedApps.isControlled("com.google.android.apps.magazines", self, isSystemApp = true))
+    }
+
+    @Test
+    fun `a user-installed wallpaper app is still counted`() {
+        // The name heuristic must apply to PRE-INSTALLED apps only — a wallpaper browser the kid
+        // installed and scrolls for an hour is real screen time.
+        assertTrue(AllowedApps.isControlled("com.wallpaperscraft.wallpaper", self, isSystemApp = false))
+        assertTrue(AllowedApps.isParentVisible("com.wallpaperscraft.wallpaper", self, isSystemApp = false, isUpdatedSystemApp = false))
+    }
+
+    @Test
+    fun `the clock heuristic does not catch Wear OS clockwork packages`() {
+        assertTrue(AllowedApps.isParentVisible("com.google.android.clockwork.home", self, isSystemApp = true, isUpdatedSystemApp = true))
+    }
+
     @Test
     fun `parent view is a superset of the kid-controlled set (minus utilities)`() {
         // Anything the kid budget controls must also be visible to the parent, except

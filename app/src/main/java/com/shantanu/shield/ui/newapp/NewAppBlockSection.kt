@@ -20,7 +20,11 @@ import com.shantanu.shield.MainViewModel
 @Composable
 fun NewAppBlockSection(viewModel: MainViewModel) {
     val unlocked by viewModel.autoBlockUnlocked.collectAsState(initial = false)
-    if (!unlocked) return
+    com.shantanu.shield.ui.PremiumGate(unlocked, "Auto-block new apps") { NewAppBlockBody(viewModel) }
+}
+
+@Composable
+private fun NewAppBlockBody(viewModel: MainViewModel) {
     val enabled by viewModel.autoBlockNewApps.collectAsState(initial = false)
 
     Card(

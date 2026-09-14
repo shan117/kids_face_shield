@@ -16,6 +16,11 @@ hilt = "2.52"
 hiltNavigationCompose = "1.2.0"
 datastore = "1.1.1"
 navigationCompose = "2.8.3"
+firebaseBom = "33.7.0"
+googleServices = "4.4.2"
+billing = "7.1.1"
+zxing = "3.5.3"
+work = "2.9.1"
 
 [libraries]
 androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
@@ -57,8 +62,26 @@ androidx-datastore-preferences = { group = "androidx.datastore", name = "datasto
 # Navigation
 androidx-navigation-compose = { group = "androidx.navigation", name = "navigation-compose", version.ref = "navigationCompose" }
 
+# Firebase (Remote Config — the promo on/off switch; Cloud Messaging — push notifications)
+firebase-bom = { group = "com.google.firebase", name = "firebase-bom", version.ref = "firebaseBom" }
+firebase-config = { group = "com.google.firebase", name = "firebase-config" }
+firebase-messaging = { group = "com.google.firebase", name = "firebase-messaging" }
+
+# Google Play Billing (subscriptions)
+billing-ktx = { group = "com.android.billingclient", name = "billing-ktx", version.ref = "billing" }
+
+# ZXing core — QR generate (child) + decode from CameraX frames (parent). Pure Java, ~0.5 MB, offline.
+zxing-core = { group = "com.google.zxing", name = "core", version.ref = "zxing" }
+
+# Firebase Firestore — encrypted remote-report relay (ciphertext only). BoM-managed version.
+firebase-firestore = { group = "com.google.firebase", name = "firebase-firestore" }
+
+# WorkManager — weekly background sync of the child's encrypted report.
+androidx-work-runtime = { group = "androidx.work", name = "work-runtime-ktx", version.ref = "work" }
+
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }
 kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }
 kotlin-compose = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin" }
 hilt-android = { id = "com.google.dagger.hilt.android", version.ref = "hilt" }
+google-services = { id = "com.google.gms.google-services", version.ref = "googleServices" }

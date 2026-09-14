@@ -11,6 +11,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Face
+import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -39,13 +40,36 @@ import kotlinx.coroutines.launch
 import java.util.*
 
 private const val REQUIRED_CONSECUTIVE_MATCHES = 3
+// Camera self-heal: if no analyzer frame arrives within this long while the camera should be scanning, the
+// front camera is likely contended (by AppFaceGate / the service overlay / a prior LockActivity) and stuck.
+// We then force a fresh rebind — capped, so a genuinely-unavailable camera can never churn (which is what
+// caused the FGS-teardown freeze).
+private const val CAMERA_STALL_MS = 3500L
+private const val MAX_CAMERA_REBINDS = 4
 
 @Composable
 fun FaceLockOverlayContent(
     packageName: String,
     forcedMessageType: Int,
     isKidModeLock: Boolean = false,
+    lockedByParent: Boolean = false,
     identifyMode: Boolean = false,
+    // Kid-mode budget lock only: today's used time and the effective daily limit (base + any parent
+    // extension). Both default to 0, which renders exactly as before — the figures are shown only when
+    // the budget is genuinely exhausted, so a night lock or a per-app-limit lock is unchanged.
+    budgetUsedMs: Long = 0L,
+    budgetLimitMs: Long = 0L,
+    // True when the kid-mode lock is the 22:00–07:00 night lock rather than an exhausted budget.
+    // Night lock is evaluated first in shouldLockForKidMode, so it wins the message too.
+    isNightLock: Boolean = false,
+    // Remote parent-lock only: false = default lock (Phone & Messages stay reachable), true = full lock.
+    isFullLock: Boolean = false,
+    // Parent-lock only: called with true when the parent taps "Unlock with parent's face" (service enters
+    // camera-FGS mode + pauses the monitor churn), and false when the scan is cancelled / times out.
+    onParentUnlockCamera: (Boolean) -> Unit = {},
+    // Default parent-lock only: launch the default Phone / Messages app so the kid can still reach them.
+    onOpenPhone: () -> Unit = {},
+    onOpenMessages: () -> Unit = {},
     onAuthenticated: () -> Unit
 ) {
     val context = LocalContext.current
@@ -57,6 +81,41 @@ fun FaceLockOverlayContent(
 
     var isAuthenticating by remember { mutableStateOf(false) }
     var isBlocked by remember { mutableStateOf(false) }
+
+    // Tap-to-start local parent-face unlock for a remote lock. The camera stays OFF until the parent taps
+    // "Unlock with parent's face"; it then runs a single time-boxed scan and fully releases. This avoids the
+    // always-on camera bind that caused the FGS-teardown freeze. Only offered if a parent face is enrolled.
+    var parentUnlockScanning by remember { mutableStateOf(false) }
+    var canFaceUnlock by remember { mutableStateOf(false) }
+    LaunchedEffect(lockedByParent) {
+        if (lockedByParent) canFaceUnlock = dataStoreManager.faceEmbedding.first() != null
+    }
+    // Auto-stop the scan after 20s so a failed attempt never holds the camera open (battery + safety).
+    LaunchedEffect(parentUnlockScanning) {
+        if (parentUnlockScanning) {
+            delay(20_000)
+            if (parentUnlockScanning) { parentUnlockScanning = false; onParentUnlockCamera(false) }
+        }
+    }
+
+    // Camera self-heal state. lastCameraFrameMs is a plain holder (written from the analyzer thread every
+    // frame) so it never triggers recomposition; cameraRebindCount is Compose state that keys the camera
+    // view, so bumping it recreates the AndroidView → a fresh CameraX bind (the automated "recents + back").
+    val lastCameraFrameMs = remember { longArrayOf(0L) }
+    var cameraRebindCount by remember { mutableStateOf(0) }
+    val cameraShouldRun = !isBlocked && (!lockedByParent || parentUnlockScanning)
+    LaunchedEffect(cameraRebindCount, cameraShouldRun) {
+        if (!cameraShouldRun) return@LaunchedEffect
+        lastCameraFrameMs[0] = System.currentTimeMillis()   // grace period after each (re)bind
+        while (cameraShouldRun && !isBlocked && cameraRebindCount < MAX_CAMERA_REBINDS) {
+            delay(1500)
+            if (System.currentTimeMillis() - lastCameraFrameMs[0] > CAMERA_STALL_MS) {
+                Log.w("AppLockOverlay", "No camera frames in ${CAMERA_STALL_MS}ms for $packageName — rebinding (self-heal #${cameraRebindCount + 1})")
+                cameraRebindCount++   // re-keys the camera view; this effect re-arms
+                return@LaunchedEffect
+            }
+        }
+    }
     var showWarningAfterDelay by remember { mutableStateOf(false) }
     val matchStreak = remember { intArrayOf(0) }
     // Multiple-kids identify state (only used when identifyMode = true).
@@ -96,7 +155,8 @@ fun FaceLockOverlayContent(
         if (!isBlocked && !identifyMode) showWarningAfterDelay = true
     }
 
-    val finalShowWarning = isBlocked || showWarningAfterDelay
+    // A parent-lock has no camera/genuine-user window, so show its message immediately (not after 1.5s).
+    val finalShowWarning = isBlocked || showWarningAfterDelay || lockedByParent
 
     // Voice trigger
     LaunchedEffect(finalShowWarning, forcedMessageType, tts) {
@@ -124,8 +184,14 @@ fun FaceLockOverlayContent(
             .background(if (finalShowWarning) Color.Black else Color.Transparent),
         contentAlignment = Alignment.Center
     ) {
-        // CAMERA: Only runs if NOT authenticated and NOT permanently blocked
-        if (!isBlocked) {
+        // CAMERA: Only runs if NOT authenticated and NOT permanently blocked.
+        // NEVER for a remote parent-lock: that overlay is cleared by the parent's *remote* Unlock (the
+        // message says "ask them to unlock it"), so it needs no face auth. Running CameraX here — and
+        // binding/unbinding it on every overlay recreate while the persistent lock holds — thrashes the
+        // camera and races the FGS CAMERA-type teardown, which can SIG-9 the process and leave the
+        // full-screen overlay stuck on screen (the "phone freezes after unlock, needs a reboot" bug).
+        if (cameraShouldRun) {
+            key(cameraRebindCount) {
             Box(modifier = Modifier.size(1.dp).alpha(0f)) {
                 AndroidView(
                     factory = { ctx ->
@@ -136,6 +202,7 @@ fun FaceLockOverlayContent(
                             val preview = Preview.Builder().build().also { it.setSurfaceProvider(previewView.surfaceProvider) }
                             val imageAnalyzer = ImageAnalysis.Builder().setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST).build().also {
                                 it.setAnalyzer(Dispatchers.Default.asExecutor()) { imageProxy ->
+                                    lastCameraFrameMs[0] = System.currentTimeMillis()   // camera is alive → self-heal stays quiet
                                     if (!isAuthenticating && !isBlocked) {
                                         isAuthenticating = true
                                         coroutineScope.launch {
@@ -229,12 +296,27 @@ fun FaceLockOverlayContent(
                     }
                 )
             }
+            }
         }
 
         if (finalShowWarning) {
             Box(modifier = Modifier.fillMaxSize().background(Color.Black), contentAlignment = Alignment.Center) {
-                if (isKidModeLock) {
-                    KidModeLockView()
+                if (lockedByParent) {
+                    ParentLockView(
+                        scanning = parentUnlockScanning,
+                        canFaceUnlock = canFaceUnlock,
+                        showCommsAccess = !isFullLock,
+                        onStartScan = { onParentUnlockCamera(true); parentUnlockScanning = true },
+                        onCancelScan = { parentUnlockScanning = false; onParentUnlockCamera(false) },
+                        onOpenPhone = onOpenPhone,
+                        onOpenMessages = onOpenMessages,
+                    )
+                } else if (isKidModeLock) {
+                    KidModeLockView(
+                        usedMs = budgetUsedMs,
+                        limitMs = budgetLimitMs,
+                        isNightLock = isNightLock
+                    )
                 } else {
                     when (forcedMessageType) {
                         0 -> HardwareErrorView()
@@ -290,32 +372,150 @@ fun KidSafeAlertView() {
 }
 
 @Composable
-fun KidModeLockView() {
-    Column(
-        horizontalAlignment = Alignment.CenterHorizontally,
-        modifier = Modifier.padding(32.dp)
-    ) {
-        Icon(Icons.Default.Warning, null, tint = Color(0xFFFF9800), modifier = Modifier.size(72.dp))
+fun ParentLockView(
+    scanning: Boolean = false,
+    canFaceUnlock: Boolean = false,
+    showCommsAccess: Boolean = false,
+    onStartScan: () -> Unit = {},
+    onCancelScan: () -> Unit = {},
+    onOpenPhone: () -> Unit = {},
+    onOpenMessages: () -> Unit = {},
+) {
+    Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(32.dp)) {
+        Icon(Icons.Default.Lock, null, tint = Color(0xFF4FC3F7), modifier = Modifier.size(72.dp))
         Spacer(Modifier.height(24.dp))
         Text(
-            "Your daily usage limit is over",
+            "Locked by parent",
             style = MaterialTheme.typography.headlineMedium,
-            color = Color(0xFFFF9800),
+            color = Color.White,
             fontWeight = FontWeight.ExtraBold,
             textAlign = TextAlign.Center
         )
         Spacer(Modifier.height(20.dp))
         Text(
-            "Please engage yourself in other activities.",
+            "A parent locked this device remotely. Ask them to unlock it.",
+            style = MaterialTheme.typography.titleMedium,
+            color = Color(0xFFB0BEC5),
+            textAlign = TextAlign.Center
+        )
+        // Default (non-full) lock leaves Phone & Messages reachable for safety — but the persistent overlay
+        // covers the home screen, so the kid can't navigate there on their own. Surface explicit buttons that
+        // launch them; the monitor loop then drops the overlay while Phone/Messages is foreground.
+        if (showCommsAccess && !scanning) {
+            Spacer(Modifier.height(28.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                OutlinedButton(onClick = onOpenPhone) { Text("📞  Phone") }
+                OutlinedButton(onClick = onOpenMessages) { Text("💬  Messages") }
+            }
+        }
+        // Local override: if a parent face is enrolled on THIS device, the parent can unlock in person with
+        // a one-shot face scan (camera starts only on tap, releases when done — never always-on).
+        if (canFaceUnlock) {
+            Spacer(Modifier.height(36.dp))
+            if (scanning) {
+                Text(
+                    "Scanning… parent, look at the camera",
+                    style = MaterialTheme.typography.titleMedium,
+                    color = Color(0xFF4FC3F7),
+                    textAlign = TextAlign.Center,
+                )
+                Spacer(Modifier.height(12.dp))
+                OutlinedButton(onClick = onCancelScan) { Text("Cancel") }
+            } else {
+                Button(onClick = onStartScan) { Text("Unlock with parent's face") }
+            }
+        }
+    }
+}
+
+/** Formats a duration the way the lock screen shows it: "2h 05m", or "45m" under an hour. */
+private fun formatLockDuration(ms: Long): String {
+    val totalMinutes = (ms.coerceAtLeast(0L) / 60_000L).toInt()
+    val hours = totalMinutes / 60
+    val minutes = totalMinutes % 60
+    return if (hours > 0) "${hours}h ${minutes.toString().padStart(2, '0')}m" else "${minutes}m"
+}
+
+@Composable
+fun KidModeLockView(usedMs: Long = 0L, limitMs: Long = 0L, isNightLock: Boolean = false) {
+    // Night lock is a different situation from an exhausted budget: nothing was overspent, and
+    // waiting will not help until morning. Calm blue instead of alarm orange, and copy that says
+    // when the phone works again.
+    val accent = if (isNightLock) Color(0xFF7986CB) else Color(0xFFFF9800)
+    Column(
+        horizontalAlignment = Alignment.CenterHorizontally,
+        modifier = Modifier.padding(32.dp)
+    ) {
+        Icon(
+            if (isNightLock) Icons.Default.Lock else Icons.Default.Warning,
+            null,
+            tint = accent,
+            modifier = Modifier.size(72.dp)
+        )
+        Spacer(Modifier.height(24.dp))
+        Text(
+            if (isNightLock) "Sleep time" else "Your daily usage limit is over",
+            style = MaterialTheme.typography.headlineMedium,
+            color = accent,
+            fontWeight = FontWeight.ExtraBold,
+            textAlign = TextAlign.Center
+        )
+        // Only when the budget really is exhausted. A night lock or a per-app-limit lock also lands
+        // on this view with the daily budget untouched — showing "12m of 2h 00m" there would flatly
+        // contradict the headline, so those keep the original layout.
+        if (!isNightLock && limitMs > 0L && usedMs >= limitMs) {
+            Spacer(Modifier.height(20.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(28.dp)) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text(
+                        "Allowed",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = Color(0xFFFFCC80)
+                    )
+                    Spacer(Modifier.height(2.dp))
+                    Text(
+                        formatLockDuration(limitMs),
+                        style = MaterialTheme.typography.titleLarge,
+                        color = Color.White,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text(
+                        "Used today",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = Color(0xFFFFCC80)
+                    )
+                    Spacer(Modifier.height(2.dp))
+                    Text(
+                        formatLockDuration(usedMs),
+                        style = MaterialTheme.typography.titleLarge,
+                        color = Color(0xFFFF9800),
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+            }
+        }
+        Spacer(Modifier.height(20.dp))
+        Text(
+            if (isNightLock) {
+                "Screen time is off from 10 PM to 7 AM."
+            } else {
+                "Please engage yourself in other activities."
+            },
             style = MaterialTheme.typography.titleMedium,
             color = Color.White,
             textAlign = TextAlign.Center
         )
         Spacer(Modifier.height(20.dp))
         Text(
-            "More screen time can harm your eyes, brain, and reduce your concentration power.",
+            if (isNightLock) {
+                "Come back tomorrow after 7 AM. Good night!"
+            } else {
+                "More screen time can harm your eyes, brain, and reduce your concentration power."
+            },
             style = MaterialTheme.typography.bodyLarge,
-            color = Color(0xFFFFCC80),
+            color = if (isNightLock) Color(0xFFC5CAE9) else Color(0xFFFFCC80),
             textAlign = TextAlign.Center,
             lineHeight = 26.sp
         )

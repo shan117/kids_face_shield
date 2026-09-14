@@ -89,6 +89,22 @@ private enum class CoachCardPlacement { Center, Above, Below }
 object CoachTours {
     const val FIRST_RUN_ID = "first-run-v2"
     const val SETTINGS_ID = "settings-tour-v1"
+    const val STATS_ID = "stats-tour-v1"
+
+    /** Parent dashboard, first visit. Introduces the "not screen time" override — otherwise the
+     *  feature is invisible, and a parent seeing the Clock or a wallpaper carousel in their charts
+     *  has no idea they can remove it. Kid-owned devices never see this. */
+    val STATS: List<CoachStep> = listOf(
+        CoachStep(
+            id = "stats-not-screen-time",
+            title = "Something here not screen time?",
+            body = "Phones count things you wouldn't — the Clock, a wallpaper carousel, an OEM " +
+                "utility. Tap the ⋮ next to any app (or long-press it) to stop counting it. Best " +
+                "kept for phone utilities: an excluded app also stops being locked at night or " +
+                "over budget. Undo it anytime at the bottom of this screen.",
+            targetId = "stats-app-breakdown"
+        )
+    )
 
     val SETTINGS: List<CoachStep> = listOf(
         CoachStep(

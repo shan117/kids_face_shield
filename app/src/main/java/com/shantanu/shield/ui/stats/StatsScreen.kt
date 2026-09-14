@@ -22,6 +22,8 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import com.shantanu.shield.ui.coachTarget
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -33,6 +35,7 @@ import androidx.compose.material3.SegmentedButtonDefaults
 import androidx.compose.material3.SingleChoiceSegmentedButtonRow
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Face
 import androidx.compose.material.icons.filled.Info
@@ -76,6 +79,22 @@ fun StatsScreen(viewModel: StatsViewModel = hiltViewModel()) {
     val context = LocalContext.current
     val snapshot by viewModel.snapshot.collectAsState()
     val mode by viewModel.viewMode.collectAsState()
+
+    // BASIC_STATS gate: if it's been converted to premium and the user isn't entitled, the whole
+    // dashboard is locked behind a Plus prompt. Default-free, so normally this never triggers.
+    val basicStatsUnlocked by viewModel.basicStatsUnlocked.collectAsState()
+    if (!basicStatsUnlocked) {
+        val openPaywall = com.shantanu.shield.ui.LocalRequestPaywall.current
+        StatsEmptyState(
+            icon = Icons.Default.Lock,
+            title = "Stats is a Plus feature",
+            body = "Upgrade to Plus to see screen time, trends, and insights.",
+            actionLabel = "Unlock with Plus",
+            onAction = openPaywall
+        )
+        return
+    }
+
     var usageGranted by remember { mutableStateOf(isUsageAccessGranted(context)) }
 
     val lifecycleOwner = LocalLifecycleOwner.current
@@ -170,7 +189,14 @@ fun StatsScreen(viewModel: StatsViewModel = hiltViewModel()) {
         }
 
         when (mode) {
-            StatsViewMode.PARENT -> ParentDashboard(snapshot)
+            StatsViewMode.PARENT -> {
+                val excluded by viewModel.excludedApps.collectAsState()
+                ParentDashboard(
+                    snap = snapshot,
+                    excludedApps = excluded,
+                    onSetExcluded = viewModel::setExcluded
+                )
+            }
             StatsViewMode.KID -> KidDashboard(snapshot)
         }
     }
@@ -444,7 +470,42 @@ private fun Long?.weekdayOrDash(): String {
 }
 
 @Composable
-private fun ParentDashboard(snap: StatsSnapshot) {
+private fun ParentDashboard(
+    snap: StatsSnapshot,
+    excludedApps: List<Pair<String, String>> = emptyList(),
+    onSetExcluded: (String, Boolean) -> Unit = { _, _ -> }
+) {
+    // Long-press target for the "not screen time" override. Parent dashboard only — this composable
+    // is never rendered on a kid-owned device (the view mode follows ownerType).
+    var pendingExclude by remember { mutableStateOf<AppUsageBucket?>(null) }
+    pendingExclude?.let { bucket ->
+        AlertDialog(
+            onDismissRequest = { pendingExclude = null },
+            title = { Text("Not screen time?") },
+            text = {
+                // The consequence list is deliberately blunt: excluding an app also removes it from
+                // enforcement, so a parent must not be able to open a loophole without reading it.
+                Text(
+                    "${bucket.name} will stop counting as screen time:\n\n" +
+                        "•  Hidden from these charts and the weekly report\n" +
+                        "•  Stops using up the daily budget\n" +
+                        "•  No longer locked — not at night, not when the budget runs out, " +
+                        "not by a per-app limit\n\n" +
+                        "You can still face-lock it from Protect. Undo this at the bottom of " +
+                        "this screen."
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    onSetExcluded(bucket.packageName, true)
+                    pendingExclude = null
+                }) { Text("Don't count it") }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingExclude = null }) { Text("Cancel") }
+            }
+        )
+    }
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
         contentPadding = PaddingValues(start = 20.dp, end = 20.dp, top = 4.dp, bottom = 28.dp),
@@ -519,7 +580,9 @@ private fun ParentDashboard(snap: StatsSnapshot) {
         }
         item {
             Card(
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .coachTarget("stats-app-breakdown"),
                 shape = RoundedCornerShape(20.dp),
                 colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer)
             ) {
@@ -547,8 +610,18 @@ private fun ParentDashboard(snap: StatsSnapshot) {
                         Spacer(Modifier.height(16.dp))
                         val total = parentOnly.sumOf { it.foregroundMs }
                         parentOnly.take(5).forEach { bucket ->
-                            AppBarRow(bucket = bucket, maxMs = total)
+                            AppBarRow(
+                                bucket = bucket,
+                                maxMs = total,
+                                onLongPress = { pendingExclude = bucket }
+                            )
                         }
+                        Spacer(Modifier.height(8.dp))
+                        Text(
+                            "Not screen time? Tap ⋮ next to an app to stop counting it.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
                     }
                 }
             }
@@ -589,6 +662,44 @@ private fun ParentDashboard(snap: StatsSnapshot) {
         if (snap.insights.isNotEmpty()) {
             item { StatsSectionLabel("Insights") }
             items(snap)
+        }
+
+        // Parent's "not screen time" overrides — the undo surface for the long-press above, and the
+        // fallback for any OEM utility (wallpaper carousel, clock, …) our rules didn't catch.
+        if (excludedApps.isNotEmpty()) {
+            item { StatsSectionLabel("Not counted as screen time") }
+            item {
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(20.dp),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer)
+                ) {
+                    Column(modifier = Modifier.padding(20.dp)) {
+                        Text(
+                            "Hidden from the charts and the weekly report. These don't use up the " +
+                                "daily budget — and aren't locked at night or over budget.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        Spacer(Modifier.height(8.dp))
+                        excludedApps.forEach { (pkg, label) ->
+                            Row(
+                                modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    label,
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = MaterialTheme.colorScheme.onSurface,
+                                    maxLines = 1,
+                                    modifier = Modifier.weight(1f)
+                                )
+                                TextButton(onClick = { onSetExcluded(pkg, false) }) { Text("Count it") }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }

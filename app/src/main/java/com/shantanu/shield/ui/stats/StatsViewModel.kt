@@ -5,13 +5,18 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.shantanu.shield.data.DataStoreManager
 import com.shantanu.shield.data.KidProfile
+import com.shantanu.shield.premium.EntitlementRepository
+import com.shantanu.shield.premium.Feature
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import javax.inject.Inject
@@ -77,7 +82,8 @@ data class FamilyComparison(val loading: Boolean = true, val kids: List<KidWeek>
 class StatsViewModel @Inject constructor(
     @ApplicationContext private val context: Context,
     private val repo: StatsRepository,
-    private val dataStoreManager: DataStoreManager
+    private val dataStoreManager: DataStoreManager,
+    private val entitlementRepository: EntitlementRepository
 ) : ViewModel() {
 
     private val _snapshot = MutableStateFlow(StatsSnapshot())
@@ -85,6 +91,74 @@ class StatsViewModel @Inject constructor(
 
     private val _viewMode = MutableStateFlow(StatsViewMode.PARENT)
     val viewMode: StateFlow<StatsViewMode> = _viewMode.asStateFlow()
+
+    // BASIC_STATS entitlement: default-free, convertible to premium via config. Initial = true so the
+    // dashboard never flashes a locked state before the flow emits.
+    val basicStatsUnlocked: StateFlow<Boolean> =
+        entitlementRepository.isUnlocked(Feature.BASIC_STATS)
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), true)
+
+    // ---- Parent "not screen time" overrides (parent dashboard only) ----
+    // Packages the parent has excluded, resolved to display labels for the restore list.
+    val excludedApps: StateFlow<List<Pair<String, String>>> =
+        dataStoreManager.statsExcludedPackages
+            .map { pkgs ->
+                pkgs.sorted().map { it to com.shantanu.shield.util.AllowedApps.labelFor(context, it) }
+            }
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+
+    /** One row of the "what counts as screen time" manager. [ms] is the last 7 budget-days. */
+    data class ManageableApp(
+        val packageName: String,
+        val label: String,
+        val icon: android.graphics.drawable.Drawable?,
+        val ms: Long,
+        val excluded: Boolean
+    )
+
+    private val _manageableApps = MutableStateFlow<List<ManageableApp>>(emptyList())
+    val manageableApps: StateFlow<List<ManageableApp>> = _manageableApps.asStateFlow()
+
+    /**
+     * Every package with recorded usage in the last week, plus anything already excluded.
+     *
+     * Built from measured USAGE rather than the installed-app list on purpose: the installed list
+     * drops pure-system packages (`isUpdatedSystemApp || !isSystemApp`), which is exactly where the
+     * OEM wallpaper carousels and clocks live — the apps this manager exists to remove. Anything
+     * that can appear in the charts must be selectable here, so the filter is only "not us".
+     */
+    fun loadManageableApps() {
+        viewModelScope.launch {
+            val excluded = dataStoreManager.statsExcludedPackages.first()
+            val buckets = withContext(Dispatchers.IO) {
+                repo.usageForDays(7) { it != context.packageName }
+            }
+            val fromUsage = buckets.map {
+                ManageableApp(it.packageName, it.name, it.icon, it.foregroundMs, it.packageName in excluded)
+            }
+            // An app excluded long enough ago to have no usage left in the window must still be
+            // listed, or it could never be restored.
+            val seen = fromUsage.mapTo(HashSet()) { it.packageName }
+            val orphaned = (excluded - seen).map {
+                ManageableApp(it, com.shantanu.shield.util.AllowedApps.labelFor(context, it), null, 0L, true)
+            }
+            _manageableApps.value = fromUsage + orphaned.sortedBy { it.label }
+        }
+    }
+
+    /** Mark [pkg] as not screen time, or restore it. Recomputes the dashboard so the change shows. */
+    fun setExcluded(pkg: String, excluded: Boolean) {
+        viewModelScope.launch {
+            dataStoreManager.setStatsExcluded(pkg, excluded)
+            // The predicate reads AllowedApps' snapshot, which the Application-scoped collector
+            // updates asynchronously — set it here too so this refresh sees the new value.
+            val next = dataStoreManager.statsExcludedPackages.first()
+            com.shantanu.shield.util.AllowedApps.setParentExcluded(next)
+            refresh()
+            // Keep the manager list in step when the change came from it.
+            if (_manageableApps.value.isNotEmpty()) loadManageableApps()
+        }
+    }
 
     // ---- Multiple-kids dashboard (Phase 6) ----
     // The dashboard switches to the per-kid view only when multi-kid is actually active

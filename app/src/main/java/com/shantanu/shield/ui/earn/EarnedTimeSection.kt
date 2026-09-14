@@ -24,8 +24,11 @@ import kotlinx.coroutines.launch
 @Composable
 fun EarnedTimeSection(viewModel: MainViewModel) {
     val unlocked by viewModel.earnedUnlocked.collectAsState(initial = false)
-    if (!unlocked) return
+    com.shantanu.shield.ui.PremiumGate(unlocked, "Earned time") { EarnedTimeBody(viewModel) }
+}
 
+@Composable
+private fun EarnedTimeBody(viewModel: MainViewModel) {
     val tasks by viewModel.earnedTasks.collectAsState(initial = emptyList())
     val snackbar = LocalSnackbarHostState.current
     val scope = rememberCoroutineScope()

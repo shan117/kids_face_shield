@@ -10,6 +10,23 @@
 .DS_Store
 /build
 /captures
+/dist
 .externalNativeBuild
 .cxx
 local.properties
+
+# Release signing — never commit keys or their passwords
+keystore.properties
+*.jks
+*.keystore
+
+# Firebase config (keyed to your project; add locally per FIREBASE_SETUP.md)
+google-services.json
+
+# Face-model conversion intermediates (tools/convert_sface.py). The shipped .tflite under
+# app/src/main/assets/ IS committed; these large ONNX/TFLite build artifacts are not.
+/tools/sface.onnx
+/tools/sface_sim.onnx
+/tools/sface_out/
+/tools/__pycache__/
+.adb_shots/

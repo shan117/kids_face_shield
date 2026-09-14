@@ -8,10 +8,10 @@
             <InsightsFilterSettings>
               <option name="connection">
                 <ConnectionSetting>
-                  <option name="appId" value="PLACEHOLDER" />
-                  <option name="mobileSdkAppId" value="" />
-                  <option name="projectId" value="" />
-                  <option name="projectNumber" value="" />
+                  <option name="appId" value="com.appsecure.shield" />
+                  <option name="mobileSdkAppId" value="1:748062156722:android:e14ebb22868d7f70f026ab" />
+                  <option name="projectId" value="app-shield-1e78f" />
+                  <option name="projectNumber" value="748062156722" />
                 </ConnectionSetting>
               </option>
               <option name="signal" value="SIGNAL_UNSPECIFIED" />

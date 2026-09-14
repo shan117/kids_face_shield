@@ -6,9 +6,8 @@ package com.shantanu.shield.premium
  */
 object Entitlements {
     fun isUnlocked(feature: Feature, config: PaywallConfig, isPremium: Boolean): Boolean {
-        if (feature in Feature.CORE_ALWAYS_FREE) return true   // never gated — child safety
         if (config.promoActive) return true                    // free-for-all period
-        if (config.tierOf(feature) == Tier.FREE) return true   // mapped free by config
+        if (config.tierOf(feature) == Tier.FREE) return true   // free by config (default or override)
         return isPremium                                       // otherwise needs premium
     }
 }

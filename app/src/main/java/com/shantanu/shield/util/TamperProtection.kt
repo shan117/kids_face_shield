@@ -20,6 +20,12 @@ object TamperProtection {
     fun isAdminActive(context: Context): Boolean =
         dpm(context).isAdminActive(adminComponent(context))
 
+    /** Device Owner = "Strict mode": the only configuration that can block force-stop and Safe Mode. A
+     *  normal sideload/Play install is never Device Owner, so this is false unless the device was
+     *  provisioned for it (future Pro / dedicated kid device — see A6). Drives the honesty banner (A5). */
+    fun isDeviceOwner(context: Context): Boolean =
+        dpm(context).isDeviceOwnerApp(context.packageName)
+
     fun enableAdminIntent(context: Context): Intent =
         Intent(DevicePolicyManager.ACTION_ADD_DEVICE_ADMIN).apply {
             putExtra(DevicePolicyManager.EXTRA_DEVICE_ADMIN, adminComponent(context))

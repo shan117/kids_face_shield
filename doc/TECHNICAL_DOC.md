@@ -24,8 +24,9 @@ A singleton utility that abstracts the complexity of computer vision.
 -   **Pre-processing**: Resizes images to `112x112` and normalizes pixel values to a `[-1, 1]` range (required by FaceNet).
 -   **Inference**: Invokes `Interpreter.run()` on the `facenet.tflite` model to produce a 128-dimensional embedding.
 -   **Similarity Scoring**: Uses `Dot Product` (Cosine Similarity) to compare vectors.
-    -   `Score > 0.5`: Verified Owner.
-    *   `Score < 0.5`: Unrecognized/Intruder.
+    -   `Score > 0.6`: Verified Owner.
+    *   `Score <= 0.6`: Unrecognized/Intruder.
+    *   1:N kid identification (`FaceMatcher`) additionally requires the best match to beat the runner-up by a `0.08` margin (sibling safety).
 
 ### C. The Reactive Store: `DataStoreManager`
 -   Serializes `FloatArray` embeddings into CSV strings for persistent storage.
@@ -74,7 +75,7 @@ This is the core security loop when a user opens a protected application.
 | :--- | :--- | :--- |
 | `POLLING_INTERVAL` | 250ms | Balancing detection responsiveness with battery consumption. |
 | `REAUTH_INTERVAL` | 60,000ms | Prevents annoying re-scans if the user briefly switches apps. |
-| `MATCH_THRESHOLD` | 0.5f | Cosine similarity limit for the FaceNet model. |
+| `MATCH_THRESHOLD` | 0.6f | Cosine similarity limit for the FaceNet model (strict `>`). 1:N identify reuses 0.6 + a 0.08 runner-up margin. |
 | `DECEPTION_DELAY` | 1,500ms | The "Invisibility Window" for seamless owner entry. |
 | `MODEL_INPUT_SIZE` | 112x112 | Required resolution for the `facenet.tflite` model. |
 

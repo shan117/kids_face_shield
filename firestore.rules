@@ -1,0 +1,28 @@
+rules_version = '2';
+
+// Parent Remote Report relay. Every document under reports/{pairingId} holds ONLY ciphertext
+// (an AES-GCM iv + ciphertext blob the relay cannot read) — see PARENT_REMOTE_REPORT_PLAN.md §2.
+//
+// Interim access model (§8): the 128-bit `pairingId` is a secret bearer token. You can read/write a
+// report only if you already know its id; listing the collection is denied so ids can't be enumerated,
+// and the payload is E2E-encrypted regardless. Production hardening = per-device Anonymous-Auth uids
+// recorded at pairing (Phase 7); swap the `if true` guards for `request.auth.uid in resource.data.uids`.
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /reports/{pairingId} {
+      // Read/write a single known doc; ciphertext only (enforced E2E, not by rules).
+      allow get, create, update: if true;
+      // No enumeration. Delete allowed so unpair/revoke can wipe the cloud copy (you must know the id).
+      allow delete: if true;
+      allow list: if false;
+    }
+
+    // Parent Remote Control: parent writes an encrypted command, child reads/listens. Same bearer-token
+    // model as reports — and crucially the command only *applies* if it decrypts under the pairing key
+    // (decryption = authorization), so knowing the id alone can't forge an action. See PARENT_REMOTE_CONTROL_PLAN.md.
+    match /commands/{pairingId} {
+      allow get, create, update, delete: if true;
+      allow list: if false;
+    }
+  }
+}

@@ -11,14 +11,14 @@ Legend: `[ ]` pending · `[~]` in progress · `[x]` done · `[!]` reverted/block
 | Phase | Description | Status | Notes |
 |---|---|---|---|
 | 0 | *(Owner)* Firebase project (analytics-free) + Remote Config; Play Console app, Data Safety, Families, subscription + discount + 30-day trial + price tiers + license testers | `[ ]` | Owner task. Blocks live Remote Config + real purchases. |
-| 1 | Entitlement + feature-flag core; then billing-ktx + firebase-config deps; `BillingManager` dormant; cache keys | `[~]` | Pure-Kotlin core landed first (builds offline). Billing/Firebase deps pending (need network + `google-services.json`). |
+| 1 | Entitlement + feature-flag core; then billing-ktx + firebase-config deps; `BillingManager` dormant; cache keys | `[~]` | 1a core done. **1b-Firebase DONE** — `FirebaseRemoteConfigSource` live, `google-services.json` (project `app-shield-1e78f`, `com.appsecure.shield`) wired, build green. Billing half still dormant/pending. |
 | 2 | Route premium-candidate features through `isUnlocked(...)` | `[ ]` | |
 | 3 | Early-access screen + Plus badge (paywall mode wired) | `[~]` | Screen + Settings "Plus" entry live; promo mode = "Continue — it's free"; paywall mode renders but purchase CTA is **dormant** until Billing (Phase 1b). |
 | 4 | Multi-kid foundation: `KidProfile` + storage + migration; 2-kid enroll; 1:N identify+margin; `ProfileSession` | `[x]` | **Done:** 4a data + 4b-1 identify engine + 4b-2 setup UI (toggle, 2 profile cards, face enrolment, migration). Enforcement is Phase 5. |
 | 5 | Multi-kid enforcement (hybrid model) in service | `[~]` | **Code-complete** (5a kernel + 5b-svc + 5b-cam identify camera), all gated behind `multi_kid_enabled`, builds clean. **⚠ DEVICE-VALIDATION PENDING** — camera/timing, can't be proven from a compile. |
 | 6 | Multi-kid dashboard (selector + family overview + drill-down) | `[x]` | Additive: shown only when `multi_kid_enabled`. Family/kid selector, per-kid used/limit + budget ring + top apps (per-profile sessions). Builds clean; per-kid numbers depend on 5b-cam attribution → device-validate. |
 | 7 | Selected extra premium features (each flagged) | `[x]` | **Done:** Earn screen-time, Schedules, New-app auto-block, Per-app limits, Themes — all gated + flagged. (multi-parent faces = explained, not requested.) |
-| 8 | Billing robustness + compliance | `[ ]` | Pre-charge. |
+| 8 | Billing robustness + compliance | `[~]` | **Gating-hardening done** (A1/A2/A3/A4/A5/A6 — see Monetization hardening log). BillingManager bound (not dormant), real RC. Remaining: server-verify (Phase 10), `PUBLIC_KEY` + Terms/Privacy URLs (owner), SFace license. |
 | 9 | *(Owner, no app update)* Set prices; flip `feature_tiers`, `promo_active=false`, `paywall_enabled=true`; optional FCM + early-user reward | `[ ]` | The "go paid" switch. |
 | 10 | *(Future)* Server-side verification; Device-Owner Pro; backend/sync | `[ ]` | Out of scope now. |
 
@@ -42,10 +42,17 @@ single `isUnlocked(...)`, with the source swappable (local defaults now → Remo
 - Unit test: `premium/EntitlementsTest.kt` — the `isUnlocked` truth table.
 - **No behavior change:** `promo_active = true` default → everything unlocked.
 
-**Step 1b (pending) — dependency-backed sources** *(needs network for deps + `google-services.json` from Phase 0):*
-- Add `com.android.billingclient:billing-ktx` → real `BillingManager` implementing `PremiumSource`.
-- Add `firebase-config` (analytics-free) → `FirebaseRemoteConfigSource` implementing `RemoteConfigSource`.
-- Swap the two `@Provides` in `di/PremiumModule.kt` from local/dormant to the real impls.
+**Step 1b — dependency-backed sources:**
+- ✅ **Firebase (done):** added `firebase-bom` + `firebase-config` + the `google-services` plugin
+  (analytics-free project `app-shield-1e78f`, app `com.appsecure.shield`, `google-services.json` in `app/`,
+  gitignored). `FirebaseRemoteConfigSource` implements `RemoteConfigSource` with shipped defaults
+  (promo on) + `feature_tiers_json` parsing; `di/PremiumModule` now binds it. Build green (network).
+  Remaining: seed the 6 Remote Config parameters in the Firebase Console to make the flip controllable.
+- ✅ **Billing B1 (done):** `billing-ktx` added; `billing/BillingManager` (connect, query products,
+  reconcile, acknowledge, cache `cached_is_premium`, `launchPurchase`, `restore`) implements
+  `PremiumSource`; `DormantPremiumSource` swapped out; `start()` called from `AppLockApplication`;
+  pure `BillingLogic` (6 tests) + `Security`. Build green, **dormant under the promo**. Remaining
+  billing work (B2 paywall UI, B3 service gating, B4 robustness, B0 Play products) → `BILLING_PLAN.md`.
 
 **Build:** Step 1a — `gradlew :app:assembleDebug :app:testDebugUnitTest --offline` **SUCCESSFUL**;
 `EntitlementsTest` **7/7 pass**; Hilt graph valid (PremiumModule bindings resolve). No behavior
@@ -285,10 +292,12 @@ view is no longer just two used/limit cards. It now compares the two kids head-t
 multi-parent faces = explained to the user, not requested. Per-app/earned/new-app features are
 device-dependent (camera/notifications/install detection/per-app lock timing) → validate on a phone.
 
-**Known gating note for Phase 8:** premium *enforcement* features (multi-kid, and the upcoming
-per-app limits) currently gate on their own toggle/data, NOT the entitlement flag — fine during the
-promo (everything unlocked). When billing flips on, the service must also consult the cached
-entitlement to revoke premium enforcement for non-premium/lapsed users.
+**Known gating note for Phase 8 — RESOLVED (Billing B3):** premium *enforcement* features (multi-kid,
+per-app limits, new-app auto-block) used to gate only on their own toggle/data, not the entitlement
+flag. `AppLockForegroundService` now injects `EntitlementRepository` and gates those three on
+`isUnlocked(...)` (`multiKidUnlocked`/`perAppLimitsUnlocked`/`newAppUnlocked`, default true = promo-safe),
+so the go-paid flip revokes premium enforcement for non-premium/lapsed users while core safety
+(app lock, single-kid budget, night lock) stays free. See `BILLING_PLAN.md` B3.
 
 ---
 
@@ -314,6 +323,32 @@ Kid Mode toggle. Per-kid per-app limits stored in a **separate key** (undo-safe)
 - **Build:** SUCCESSFUL (offline), **59 tests pass** (+`KidPerAppLimitCodecTest`, 5).
 - ⚠ **Device-validate:** the independence gate + per-kid per-app lock touch the live lock path —
   confirm on a phone (identify → right kid → per-kid budget + per-app cap timing). Compile ≠ works.
+
+---
+
+## Monetization hardening — A-streams (Phase 8, done; ref `MONETIZATION_PLAN.md`)
+
+Make the `promo_active=false` flip actually lock/block, with consistent upsell + Play-policy paywall.
+
+- **A1 — paywall-on-tap.** `ui/PremiumGate.kt` (lock card + "Unlock with Plus" CTA via `LocalRequestPaywall`).
+  Hard-gates: Schedules, Earned time, Auto-block new apps, Per-app limits, Multiple kids, Themes, Remote report.
+- **A2 — revoke-on-lapse.** `premium/EntitlementRevoker.kt` (`@Singleton`, started in `AppLockApplication`).
+  Watches each premium toggle; when an entitlement lapses while still ON, switches it OFF (report-sharing,
+  remote-control, multi-kid, auto-block, Themes→default accent). Enforcement features already stop in-service.
+- **A3 — consistent Plus badges + tap→paywall everywhere.** `LocalRequestPaywall` **hoisted to MainScreen**
+  (`selectedTab=2; pendingPaywall=true`) so gated controls on ANY tab reach the paywall; `SettingsScreen`
+  consumes the pending flag (`openPaywallSignal`). Wired: Stats locked empty-state CTA, Allowed-presets
+  "C. Custom" locked row (`PresetOption` locked tap → paywall), ParentSetup Share/Remote-control locked cards.
+- **A4 — paywall completeness.** `PaywallScreen.kt`: Manage-subscription deep link (always live),
+  Terms/Privacy hidden while URLs blank (no dead links), auto-renew/restore/empty-state copy present.
+- **A5 — entitlement resilience.** RC `minimumFetchIntervalInSeconds` 3600→900; gates/paywall read `config`
+  as live Compose state (killed the stale "Free for now").
+- **A6 — billing robustness.** `BillingManager.kt`: PENDING never grants (`toInfo().purchased` requires
+  `PURCHASED`); ack ≤3d present; obfuscated account id (SHA-256 of ANDROID_ID) on `launchPurchase`;
+  reconcile keeps cache on transient failure (grace-safe). `PUBLIC_KEY=""` (sig disabled) until owner pastes it.
+- **Build green, 130 tests pass.**
+- **Owner/pending:** Terms+Privacy URLs, Licensing `PUBLIC_KEY`, price/trial, free-vs-premium split;
+  Play Console `premium` product + testers + AAB upload; **SFace license before charging**; server-verify (Phase 10).
 
 ---
 

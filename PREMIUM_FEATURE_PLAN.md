@@ -18,7 +18,7 @@ no app update.
 | D2 | **Multi-kid ships in v1**, free now; parent toggles **single (default) or 2-kid**. |
 | D3 | **Profiles cap = 2.** |
 | D4 | **Remote Config from v1** with **shipped local defaults**; cloud overrides, no update. |
-| D5 | **Every premium-candidate feature** is gated by a Remote Config flag. **Core safety is hardcoded always-free** (never flippable). |
+| D5 | **Every feature** is config-driven (Remote Config) free↔premium. Defaults keep the core set free, but **any feature can be converted to premium with no app update** (each default-free feature needs its enforcement gate added in code to take effect). _Updated: the original "core hardcoded always-free, never flippable" guarantee was **removed** at the owner's request for full monetization flexibility._ |
 | D6 | **Promo ends manually** (`promo_active=false`), not on a timer. Free/premium split decided **after** the promo from real usage. |
 | D7 | **Subscription + discount (intro offer) + 30-day trial configured in Play Console *before* launch**; billing dormant; app reads real prices. |
 | D8 | **Price amounts live in Play Console**; Remote Config only picks which tier/offer to show. |
@@ -71,16 +71,16 @@ no app update.
 ## 4. Entitlement logic (exact)
 ```
 isUnlocked(f):
-   if f in CORE_ALWAYS_FREE        -> true      // hardcoded, never flippable
    if config.promo_active          -> true      // free-for-all period
-   if feature_tiers[f] == FREE     -> true
-   else                            -> isPremium
+   if feature_tiers[f] == FREE     -> true      // free by config (default or override); any feature
+   else                            -> isPremium  // any feature can be premium — incl. default-free ones
 ```
 `isPremium` = an **active, acknowledged** `premium` SUBS purchase, **signature-verified**, cached in
 DataStore, **re-queried from Play every launch** (cache never authoritative). **Service reads the
 cached flag only** and never blocks protection if billing/Play is unavailable.
 
 ## 5. Billing flow (exact, dormant until promo off)
+> **Detailed build + config-driven-flip plan (no app update): `BILLING_PLAN.md`.**
 1. Connect `BillingClient`; retry on disconnect.
 2. `queryProductDetailsAsync` for `premium` (SUBS) → offers (base + intro + trial).
 3. Paywall CTA → `launchBillingFlow` with the offer matching `price_tier`.
@@ -111,6 +111,8 @@ Single-kid & parent-phone modes: **no identity scans, behavior unchanged.**
 - **Paywall mode** (`promo_active=false` & `paywall_enabled=true` & not premium): real `ProductDetails` prices, **honest strikethrough** (base vs intro/annual-monthly-equiv), 30-day trial timeline, **Restore**, Terms/Privacy.
 
 ## 9. What the OWNER configures (before launch)
+> **Detailed step-by-step store/release/runtime-flip playbook: `PLAYSTORE_RELEASE_PLAN.md`.** This section is the summary.
+
 **Firebase:** create project → add `google-services.json` → **disable Analytics / ad-id** → seed Remote Config keys (§3).
 **Play Console:** listing → **Data Safety** + **Designed-for-Families** → **Privacy + Terms URLs** → subscription `premium` (monthly + annual) → **intro/discount offer + 30-day trial** → **price tiers** → **license testers** → internal testing track.
 
@@ -132,8 +134,12 @@ Single-kid & parent-phone modes: **no identity scans, behavior unchanged.**
 **Launch free:** Phases 0–6. **Monetize later:** 8 → 9 (runtime). **Order:** 0→1→2→3→4→5→6→8→7→9.
 
 ## 11. Default free/premium map (shipped default — flippable after promo)
-- **CORE_ALWAYS_FREE (hardcoded):** app lock, single-kid budget, night lock, allowed presets, Free Play, tamper, basic (today/7-day) stats.
-- **PREMIUM (default; flip anytime):** `MULTI_KID_PROFILES`, `SCHEDULES`, `PER_APP_LIMITS`, `FULL_STATS`, `EARNED_TIME`, `MULTI_PARENT`, `NEW_APP_AUTO_BLOCK`, `THEMES`.
+- **DEFAULT_FREE (free at launch; convertible to premium via config + a per-feature gate):** `APP_LOCK`, `KID_BUDGET`, `NIGHT_LOCK`, `ALLOWED_PRESETS`, `FREE_PLAY`, `TAMPER`, `BASIC_STATS`. **All gates built** — every feature is convertible to premium via config + enforced:
+`NIGHT_LOCK`, `KID_BUDGET`, `FREE_PLAY`, `TAMPER`, `APP_LOCK` (service gates in `AppLockForegroundService`) +
+`BASIC_STATS` (Stats tab) and `ALLOWED_PRESETS` (Custom-picker only — preset C, Kid Mode UI). Defaults
+unchanged (all free today). ⚠ Device-validate the lock-path gates, `APP_LOCK` especially (it can disable
+all protection when flipped premium for a non-subscriber).
+- **DEFAULT_PREMIUM (premium by default; flip anytime):** `MULTI_KID_PROFILES`, `SCHEDULES`, `PER_APP_LIMITS`, `FULL_STATS`, `EARNED_TIME`, `MULTI_PARENT`, `NEW_APP_AUTO_BLOCK`, `THEMES`, `REMOTE_REPORT` (gate enforced on the child's "Share weekly report" toggle; see `PARENT_REMOTE_REPORT_PLAN.md`), `REMOTE_CONTROL` (parent→child commands — gate on the child's "Allow remote control" opt-in + the parent's control buttons; see `PARENT_REMOTE_CONTROL_PLAN.md`).
 - During the promo all are free regardless; this map only takes effect when `promo_active=false`.
 
 ## 12. Known & accepted limitations

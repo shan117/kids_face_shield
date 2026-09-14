@@ -16,12 +16,9 @@ data class PaywallConfig(
     val premiumFeatures: Set<Feature> = Feature.DEFAULT_PREMIUM,
     val paywallVariant: String = "a"
 ) {
-    /** Effective tier of a feature. Core features are FREE regardless of [premiumFeatures]. */
-    fun tierOf(feature: Feature): Tier = when {
-        feature in Feature.CORE_ALWAYS_FREE -> Tier.FREE
-        feature in premiumFeatures -> Tier.PREMIUM
-        else -> Tier.FREE
-    }
+    /** Effective tier of a feature — entirely config-driven (any feature can be either). */
+    fun tierOf(feature: Feature): Tier =
+        if (feature in premiumFeatures) Tier.PREMIUM else Tier.FREE
 
     companion object {
         val DEFAULT = PaywallConfig()

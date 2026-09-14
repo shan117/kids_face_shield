@@ -19,9 +19,16 @@ import android.app.usage.UsageStatsManager
  */
 object UsageMeasure {
 
-    enum class Type { RESUMED, PAUSED_OR_STOPPED }
+    // SCREEN_OFF is a device-level terminator (screen non-interactive / keyguard / shutdown). On
+    // screen-off, no app is foreground, yet some apps never emit a per-app PAUSED/STOPPED then — so
+    // without this their RESUMED session would run to the window end and wildly inflate the total
+    // (e.g. the Clock showing ~2h because it was foreground when the screen went off).
+    enum class Type { RESUMED, PAUSED_OR_STOPPED, SCREEN_OFF }
 
     data class Event(val pkg: String, val type: Type, val timeStamp: Long)
+
+    /** Controlled-app session count (pickups) + longest single session, for the richer Remote Report. */
+    data class SessionStats(val count: Int, val longestMs: Long)
 
     /**
      * Pure reduction over an in-order event stream — no Android dependencies, so it is
@@ -40,6 +47,16 @@ object UsageMeasure {
                     val delta = (e.timeStamp - start).coerceAtLeast(0L)
                     totals[e.pkg] = (totals[e.pkg] ?: 0L) + delta
                 }
+                Type.SCREEN_OFF -> {
+                    // Close EVERY open session at the screen-off timestamp — nothing is foreground
+                    // once the screen is off, so no session may keep accruing past this point.
+                    val it = sessionStart.entries.iterator()
+                    while (it.hasNext()) {
+                        val (pkg, start) = it.next()
+                        totals[pkg] = (totals[pkg] ?: 0L) + (e.timeStamp - start).coerceAtLeast(0L)
+                        it.remove()
+                    }
+                }
             }
         }
         // Any app still in the foreground at the window end counts up to that end.
@@ -51,20 +68,91 @@ object UsageMeasure {
     }
 
     /** Android adapter: query events in [startMs, endMs] and reduce them. */
-    fun foregroundMsByPackage(usm: UsageStatsManager, startMs: Long, endMs: Long): Map<String, Long> {
+    fun foregroundMsByPackage(usm: UsageStatsManager, startMs: Long, endMs: Long): Map<String, Long> =
+        reduceForegroundMs(eventsIn(usm, startMs, endMs), endMs)
+
+    /** Android adapter: pull the in-order Event stream for a window. Shared by the reducer above and the
+     *  richer-report aggregations (hourly buckets + session stats) below. */
+    fun eventsIn(usm: UsageStatsManager, startMs: Long, endMs: Long): List<Event> {
         val raw = usm.queryEvents(startMs, endMs)
         val events = ArrayList<Event>()
         val ev = UsageEvents.Event()
         while (raw.hasNextEvent()) {
             raw.getNextEvent(ev)
-            val pkg = ev.packageName ?: continue
-            val type = when (ev.eventType) {
-                UsageEvents.Event.ACTIVITY_RESUMED -> Type.RESUMED
-                UsageEvents.Event.ACTIVITY_PAUSED, UsageEvents.Event.ACTIVITY_STOPPED -> Type.PAUSED_OR_STOPPED
-                else -> continue
+            when (ev.eventType) {
+                UsageEvents.Event.ACTIVITY_RESUMED ->
+                    ev.packageName?.let { events.add(Event(it, Type.RESUMED, ev.timeStamp)) }
+                UsageEvents.Event.ACTIVITY_PAUSED, UsageEvents.Event.ACTIVITY_STOPPED ->
+                    ev.packageName?.let { events.add(Event(it, Type.PAUSED_OR_STOPPED, ev.timeStamp)) }
+                // Device-level terminators: screen off / locked / shutting down → close all sessions.
+                // (Constants exist since API 28/30; harmlessly never emitted on older devices.)
+                UsageEvents.Event.SCREEN_NON_INTERACTIVE,
+                UsageEvents.Event.KEYGUARD_SHOWN,
+                UsageEvents.Event.DEVICE_SHUTDOWN ->
+                    events.add(Event("", Type.SCREEN_OFF, ev.timeStamp))
+                else -> {}
             }
-            events.add(Event(pkg, type, ev.timeStamp))
         }
-        return reduceForegroundMs(events, endMs)
+        return events
+    }
+
+    /**
+     * Pure: foreground ms bucketed by hour-of-day (0..23), summed across all sessions that pass [include].
+     * Sessions are split at hour boundaries; SCREEN_OFF closes open sessions. Drives the report's
+     * time-of-day pattern + night-usage view. No package is foreground after screen-off, so nothing leaks.
+     */
+    fun hourlyForegroundMs(events: List<Event>, windowEndMs: Long, include: (String) -> Boolean): LongArray {
+        val buckets = LongArray(24)
+        val sessionStart = HashMap<String, Long>()
+        for (e in events) {
+            when (e.type) {
+                Type.RESUMED -> if (include(e.pkg)) sessionStart[e.pkg] = e.timeStamp
+                Type.PAUSED_OR_STOPPED -> sessionStart.remove(e.pkg)?.let { addHourly(buckets, it, e.timeStamp) }
+                Type.SCREEN_OFF -> {
+                    val it = sessionStart.entries.iterator()
+                    while (it.hasNext()) { val (_, st) = it.next(); addHourly(buckets, st, e.timeStamp); it.remove() }
+                }
+            }
+        }
+        for ((_, st) in sessionStart) addHourly(buckets, st, windowEndMs)
+        return buckets
+    }
+
+    private fun addHourly(buckets: LongArray, start: Long, end: Long) {
+        if (end <= start) return
+        val cal = java.util.Calendar.getInstance()
+        var s = start
+        while (s < end) {
+            cal.timeInMillis = s
+            val hour = cal.get(java.util.Calendar.HOUR_OF_DAY)
+            cal.add(java.util.Calendar.HOUR_OF_DAY, 1)
+            cal.set(java.util.Calendar.MINUTE, 0); cal.set(java.util.Calendar.SECOND, 0); cal.set(java.util.Calendar.MILLISECOND, 0)
+            val segEnd = minOf(end, cal.timeInMillis)
+            buckets[hour] += (segEnd - s)
+            s = segEnd
+        }
+    }
+
+    /** Pure: controlled-app session count (pickups) + longest single session over the window. */
+    fun sessionStats(events: List<Event>, windowEndMs: Long, include: (String) -> Boolean): SessionStats {
+        var count = 0
+        var longest = 0L
+        val sessionStart = HashMap<String, Long>()
+        fun close(st: Long, end: Long) {
+            val d = (end - st).coerceAtLeast(0L)
+            if (d > 0L) { count++; if (d > longest) longest = d }
+        }
+        for (e in events) {
+            when (e.type) {
+                Type.RESUMED -> if (include(e.pkg)) sessionStart[e.pkg] = e.timeStamp
+                Type.PAUSED_OR_STOPPED -> sessionStart.remove(e.pkg)?.let { close(it, e.timeStamp) }
+                Type.SCREEN_OFF -> {
+                    val it = sessionStart.entries.iterator()
+                    while (it.hasNext()) { val (_, st) = it.next(); close(st, e.timeStamp); it.remove() }
+                }
+            }
+        }
+        for ((_, st) in sessionStart) close(st, windowEndMs)
+        return SessionStats(count, longest)
     }
 }

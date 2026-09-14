@@ -1,6 +1,7 @@
 package com.shantanu.shield
 
 import android.Manifest
+import android.os.Build
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -90,8 +91,13 @@ class MainActivity : ComponentActivity() {
             val rootViewModel: MainViewModel = androidx.hilt.navigation.compose.hiltViewModel()
             val accentKey by rootViewModel.themeAccent.collectAsState(initial = "teal")
             AppShieldTheme(accent = com.shantanu.shield.ui.theme.AppAccent.fromKey(accentKey)) {
-                AppLockGate {
-                    MainScreen()
+                // Device role decides the shell. A *child* device shows a locked-down dashboard with the full
+                // app behind a fresh parent face (ChildDeviceRoot); parent/unmanaged devices are unchanged.
+                val role by rootViewModel.remoteRole.collectAsState(initial = null)
+                when (role) {
+                    null -> Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.surface)) // role loading
+                    "child" -> ChildDeviceRoot()
+                    else -> AppLockGate { MainScreen() }
                 }
             }
         }
@@ -141,7 +147,12 @@ fun AppLockGate(content: @Composable () -> Unit) {
     val lifecycleOwner = LocalLifecycleOwner.current
     DisposableEffect(lifecycleOwner) {
         val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
-            if (event == androidx.lifecycle.Lifecycle.Event.ON_STOP) authenticated = false
+            if (event == androidx.lifecycle.Lifecycle.Event.ON_STOP) {
+                authenticated = false
+                // Leaving the app drops the parent's proof of identity, so parent-only controls
+                // re-lock for whoever picks the phone up next.
+                com.shantanu.shield.ui.ParentAuthSession.clear()
+            }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
@@ -149,9 +160,75 @@ fun AppLockGate(content: @Composable () -> Unit) {
 
     val mustLock = lockOwnApp && faceEmbedding != null && checkCameraPermission(context) && !authenticated
     if (mustLock) {
-        AppFaceGate(onAuthenticated = { authenticated = true })
+        AppFaceGate(onAuthenticated = {
+            authenticated = true
+            // This gate verifies the PARENT's enrolled face, so passing it is parent proof.
+            com.shantanu.shield.ui.ParentAuthSession.markAuthenticated()
+        })
     } else {
         content()
+    }
+}
+
+/**
+ * Wraps a control only the parent may use. On a parent-owned device it is a pass-through. On a
+ * KID-owned device it demands a parent face scan first — unless [AppLockGate] already verified one
+ * this session, in which case the proof carries over and there is no second scan.
+ *
+ * Blocks rather than falls open when no parent face is enrolled: on a kid's phone an unverifiable
+ * control is a control the kid can use.
+ */
+@Composable
+fun ParentGate(content: @Composable () -> Unit) {
+    val context = LocalContext.current
+    val dataStoreManager = remember { DataStoreManager(context) }
+    val ownerType by dataStoreManager.ownerType.collectAsState(initial = "parent")
+    val faceEmbedding by dataStoreManager.faceEmbedding.collectAsState(initial = null)
+    val alreadyVerified by com.shantanu.shield.ui.ParentAuthSession.authenticated.collectAsState()
+    var scanning by remember { mutableStateOf(false) }
+
+    // Parent-owned device: the whole app is the parent's, nothing extra to prove.
+    if (ownerType != "kid" || alreadyVerified) { content(); return }
+
+    if (scanning) {
+        AppFaceGate(onAuthenticated = {
+            com.shantanu.shield.ui.ParentAuthSession.markAuthenticated()
+            scanning = false
+        })
+        return
+    }
+
+    val canScan = faceEmbedding != null && checkCameraPermission(context)
+    Card(
+        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+        shape = RoundedCornerShape(20.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer)
+    ) {
+        Column(
+            modifier = Modifier.fillMaxWidth().padding(20.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Icon(Icons.Default.Lock, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+            Spacer(Modifier.height(8.dp))
+            Text("Parent only", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+            Spacer(Modifier.height(4.dp))
+            Text(
+                if (canScan) {
+                    "This phone is set up for a child. Scan the parent's face to change what counts " +
+                        "as screen time."
+                } else {
+                    "This phone is set up for a child, and no parent face is enrolled — so this " +
+                        "can't be unlocked here. Enrol a parent face from the Face tab first."
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                textAlign = TextAlign.Center
+            )
+            if (canScan) {
+                Spacer(Modifier.height(12.dp))
+                Button(onClick = { scanning = true }) { Text("Scan parent's face") }
+            }
+        }
     }
 }
 
@@ -168,6 +245,32 @@ fun AppFaceGate(onAuthenticated: () -> Unit) {
     var status by remember { mutableStateOf(AppFaceAuthStatus.SEARCHING) }
     var failedAttempts by remember { mutableIntStateOf(0) }
     var lastFaceSeenAtMs by remember { mutableLongStateOf(0L) }
+
+    // Camera self-heal (same approach as FaceLockOverlayContent): if the front camera is contended and
+    // delivers no frames for a few seconds, force a fresh rebind instead of leaving the user stuck (the
+    // automated "recents + back"). Capped so a truly-unavailable camera can never churn.
+    val lastCameraFrameMs = remember { longArrayOf(0L) }
+    var cameraRebindCount by remember { mutableStateOf(0) }
+
+    // Release the front camera when this gate leaves composition (e.g. the parent taps Cancel on the
+    // child dashboard). The camera is bound to the Activity lifecycle, which stays RESUMED after the
+    // gate disappears — so without this it leaks, draining battery and risking the camera/FGS freeze.
+    val cameraProviderRef = remember { arrayOfNulls<ProcessCameraProvider>(1) }
+    DisposableEffect(Unit) {
+        onDispose { try { cameraProviderRef[0]?.unbindAll() } catch (_: Exception) {} }
+    }
+
+    LaunchedEffect(cameraRebindCount) {
+        lastCameraFrameMs[0] = System.currentTimeMillis()   // grace period after each (re)bind
+        while (cameraRebindCount < 4) {
+            kotlinx.coroutines.delay(1500)
+            if (System.currentTimeMillis() - lastCameraFrameMs[0] > 3500L) {
+                android.util.Log.w("AppFaceGate", "No camera frames in 3.5s — rebinding (self-heal #${cameraRebindCount + 1})")
+                cameraRebindCount++
+                return@LaunchedEffect
+            }
+        }
+    }
 
     LaunchedEffect(status) {
         // After ~2.5s with no face seen, revert NO_MATCH back to SEARCHING so
@@ -214,16 +317,20 @@ fun AppFaceGate(onAuthenticated: () -> Unit) {
             }
         }
 
-        // Hidden front camera continuously scanning for the enrolled face.
+        // Hidden front camera continuously scanning for the enrolled face. Wrapped in key() so the self-heal
+        // watchdog can recreate it (fresh CameraX bind) when frames stall.
+        androidx.compose.runtime.key(cameraRebindCount) {
         Box(modifier = Modifier.size(1.dp).alpha(0f)) {
             AndroidView(factory = { ctx ->
                 val previewView = PreviewView(ctx)
                 val cameraProviderFuture = ProcessCameraProvider.getInstance(ctx)
                 cameraProviderFuture.addListener({
                     val cameraProvider = cameraProviderFuture.get()
+                    cameraProviderRef[0] = cameraProvider   // so onDispose can release the camera
                     val preview = Preview.Builder().build().also { it.setSurfaceProvider(previewView.surfaceProvider) }
                     val imageAnalyzer = ImageAnalysis.Builder().setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST).build().also {
                         it.setAnalyzer(Dispatchers.Default.asExecutor()) { imageProxy ->
+                            lastCameraFrameMs[0] = System.currentTimeMillis()   // camera is alive → self-heal stays quiet
                             if (isVerifying) { imageProxy.close(); return@setAnalyzer }
                             isVerifying = true
                             coroutineScope.launch {
@@ -261,6 +368,166 @@ fun AppFaceGate(onAuthenticated: () -> Unit) {
                 previewView
             }, modifier = Modifier.fillMaxSize())
         }
+        }
+    }
+}
+
+// Child-device shell. On a device set up as the child (remoteRole == "child"), the child sees only a minimal
+// dashboard; the full management UI (MainScreen) is revealed only after a FRESH parent face, and that access
+// is dropped the instant the app leaves the foreground — so a child can't inherit the parent's unlock.
+// Fail-open (like AppLockGate): with no parent face enrolled yet, management is open so the parent can finish
+// setup / recover and never gets locked out.
+@Composable
+fun ChildDeviceRoot() {
+    val context = LocalContext.current
+    val dataStoreManager = remember { DataStoreManager(context) }
+    val faceEmbedding by dataStoreManager.faceEmbedding.collectAsState(initial = null)
+    var parentMode by remember { mutableStateOf(false) }
+    var requestingFace by remember { mutableStateOf(false) }
+
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
+            if (event == androidx.lifecycle.Lifecycle.Event.ON_STOP) {
+                parentMode = false       // drop parent access when the app backgrounds
+                requestingFace = false
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
+    val canGate = faceEmbedding != null && checkCameraPermission(context)
+
+    when {
+        parentMode || !canGate -> MainScreen()
+        requestingFace -> Box(Modifier.fillMaxSize()) {
+            AppFaceGate(onAuthenticated = { parentMode = true; requestingFace = false })
+            TextButton(
+                onClick = { requestingFace = false },
+                modifier = Modifier.align(Alignment.TopStart).padding(8.dp)
+            ) { Text("Cancel") }
+        }
+        else -> ChildDashboard(onParentSettings = { requestingFace = true })
+    }
+}
+
+@Composable
+private fun ChildDashboard(onParentSettings: () -> Unit) {
+    val vm: MainViewModel = androidx.hilt.navigation.compose.hiltViewModel()
+    val limitMin by vm.dailyLimitMinutes.collectAsState(initial = 0)
+    val usedMs by vm.screenTimeUsedMs.collectAsState(initial = 0L)
+    val extMs by vm.extensionsTodayMs.collectAsState(initial = 0L)
+    val allowedCustom by vm.customAlwaysAllowed.collectAsState(initial = emptySet())
+    val multiKid by vm.multiKidEnabled.collectAsState(initial = false)
+    var showAsk by remember { mutableStateOf(false) }
+
+    // Mirrors the enforcement formula in AppLockForegroundService: locked when usedMin >= limit + extMin.
+    val totalMin = limitMin + (extMs / 60_000L).toInt()
+    val usedMin = (usedMs / 60_000L).toInt()
+    val leftMin = (totalMin - usedMin).coerceAtLeast(0)
+    fun hm(m: Int) = if (m >= 60) "${m / 60}h ${m % 60}m" else "${m}m"
+
+    Column(
+        modifier = Modifier.fillMaxSize().background(MaterialTheme.colorScheme.surface)
+            .windowInsetsPadding(WindowInsets.safeDrawing)   // keep content clear of status + nav bars
+            .verticalScroll(rememberScrollState())
+            .padding(24.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Spacer(Modifier.height(24.dp))
+        Box(
+            modifier = Modifier.size(88.dp).clip(CircleShape).background(MaterialTheme.colorScheme.primaryContainer),
+            contentAlignment = Alignment.Center
+        ) {
+            Icon(Icons.Default.Face, null, modifier = Modifier.size(44.dp), tint = MaterialTheme.colorScheme.onPrimaryContainer)
+        }
+        Spacer(Modifier.height(16.dp))
+        Text("This device is managed", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold, textAlign = TextAlign.Center)
+        Spacer(Modifier.height(24.dp))
+
+        when {
+            multiKid -> {
+                // Per-kid budgets aren't surfaced here yet (v1) — show a generic managed message.
+                Text(
+                    "Your screen time and apps are set by your parent.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    textAlign = TextAlign.Center
+                )
+            }
+            limitMin > 0 -> {
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(20.dp),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer)
+                ) {
+                    Column(modifier = Modifier.fillMaxWidth().padding(20.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                        Text("Time left today", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Spacer(Modifier.height(4.dp))
+                        Text(
+                            hm(leftMin),
+                            style = MaterialTheme.typography.displaySmall,
+                            fontWeight = FontWeight.Bold,
+                            color = if (leftMin == 0) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary
+                        )
+                        Spacer(Modifier.height(12.dp))
+                        LinearProgressIndicator(
+                            progress = { (usedMin.toFloat() / totalMin.coerceAtLeast(1)).coerceIn(0f, 1f) },
+                            modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp))
+                        )
+                        Spacer(Modifier.height(8.dp))
+                        Text(
+                            if (leftMin == 0) "Daily limit reached" else "${hm(usedMin)} of ${hm(totalMin)} used",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+            }
+            else -> {
+                Text(
+                    "No screen-time limit is set right now.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    textAlign = TextAlign.Center
+                )
+            }
+        }
+
+        if (allowedCustom.isNotEmpty()) {
+            Spacer(Modifier.height(12.dp))
+            Text(
+                "${allowedCustom.size} app${if (allowedCustom.size == 1) "" else "s"} always allowed",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+
+        Spacer(Modifier.height(24.dp))
+        Button(onClick = { showAsk = true }, modifier = Modifier.fillMaxWidth()) {
+            Text("Ask for more time")
+        }
+
+        Spacer(Modifier.height(32.dp))
+        OutlinedButton(onClick = onParentSettings) {
+            Icon(Icons.Default.Lock, null, modifier = Modifier.size(18.dp))
+            Spacer(Modifier.width(8.dp))
+            Text("Parent settings")
+        }
+        Spacer(Modifier.height(16.dp))
+    }
+
+    if (showAsk) {
+        AlertDialog(
+            onDismissRequest = { showAsk = false },
+            icon = { Icon(Icons.Default.Face, null) },
+            title = { Text("Ask for more time") },
+            text = {
+                Text("Only a parent can add time. Ask them — they can grant more from “Parent settings” here, or remotely from their own phone.")
+            },
+            confirmButton = { TextButton(onClick = { showAsk = false }) { Text("OK") } }
+        )
     }
 }
 
@@ -281,6 +548,14 @@ fun MainScreen(viewModel: MainViewModel = hiltViewModel()) {
     val coachMarks = remember { com.shantanu.shield.ui.CoachMarkController() }
     val seenTours by viewModel.seenTours.collectAsState(initial = emptySet())
 
+    // In Kid Mode (this device enforces a budget) the "Protect" tab — the parent-phone block-list that
+    // shields hand-picked apps behind a face — is the wrong model: a kid's phone locks everything *except*
+    // the always-allowed list when the budget runs out. So hide Protect here and keep the parent on Settings
+    // (Kid Mode config) instead of landing on a tab that no longer exists.
+    val ownerType by viewModel.ownerType.collectAsState(initial = "parent")
+    val kidMode = ownerType == "kid"
+    LaunchedEffect(kidMode) { if (kidMode && selectedTab == 1) selectedTab = 2 }
+
     if (firstRunCompleted == null) {
         // DataStore loading — render empty to avoid flashing the wizard.
         Box(modifier = Modifier.fillMaxSize().background(MaterialTheme.colorScheme.surface))
@@ -289,7 +564,9 @@ fun MainScreen(viewModel: MainViewModel = hiltViewModel()) {
 
     if (firstRunCompleted == false) {
         if (enrollingFromWizard) {
-            FaceEnrollmentScreen(viewModel)
+            // Rendered as root (no Scaffold), so apply system-bar insets here or the title clips under the
+            // status bar. In the Face tab the Scaffold already insets it, so don't pad inside the screen.
+            Box(Modifier.windowInsetsPadding(WindowInsets.safeDrawing)) { FaceEnrollmentScreen(viewModel) }
             val faceEmbedding by viewModel.faceEmbedding.collectAsState(initial = null)
             LaunchedEffect(faceEmbedding) {
                 if (faceEmbedding != null) enrollingFromWizard = false
@@ -337,11 +614,33 @@ fun MainScreen(viewModel: MainViewModel = hiltViewModel()) {
         }
     }
 
+    // First visit to the Stats tab on a PARENT-owned device → introduce the "not screen time"
+    // override once. Skipped on a kid-owned device, where the dashboard renders the Kid view and
+    // the override doesn't exist. Replayable from Settings > Help & Onboarding.
+    LaunchedEffect(firstRunCompleted, seenTours, selectedTab, kidMode) {
+        if (firstRunCompleted == true &&
+            selectedTab == 3 &&
+            !kidMode &&
+            !seenTours.contains(com.shantanu.shield.ui.CoachTours.STATS_ID) &&
+            !coachMarks.visible
+        ) {
+            kotlinx.coroutines.delay(600)
+            coachMarks.start(
+                com.shantanu.shield.ui.CoachTours.STATS_ID,
+                com.shantanu.shield.ui.CoachTours.STATS
+            )
+        }
+    }
+
     val topBarOverride = remember { mutableStateOf<com.shantanu.shield.ui.TopBarOverride?>(null) }
+    // Global paywall request: lets gated controls on ANY tab (e.g. Stats) jump to Settings → Paywall.
+    // SettingsScreen consumes the pending flag and opens the Paywall route.
+    var pendingPaywall by remember { mutableStateOf(false) }
     CompositionLocalProvider(
         LocalSnackbarHostState provides snackbarHostState,
         com.shantanu.shield.ui.LocalCoachMarks provides coachMarks,
         com.shantanu.shield.ui.LocalRequestTab provides { tab -> selectedTab = tab },
+        com.shantanu.shield.ui.LocalRequestPaywall provides { selectedTab = 2; pendingPaywall = true },
         com.shantanu.shield.ui.LocalTopBarOverride provides topBarOverride
     ) {
     Box(modifier = Modifier.fillMaxSize()) {
@@ -380,12 +679,14 @@ fun MainScreen(viewModel: MainViewModel = hiltViewModel()) {
                     icon = { Icon(Icons.Default.Face, null) },
                     label = { Text("Face") }
                 )
-                NavigationBarItem(
-                    selected = selectedTab == 1,
-                    onClick = { selectedTab = 1 },
-                    icon = { Icon(Icons.Default.Lock, null) },
-                    label = { Text("Protect") }
-                )
+                if (!kidMode) {
+                    NavigationBarItem(
+                        selected = selectedTab == 1,
+                        onClick = { selectedTab = 1 },
+                        icon = { Icon(Icons.Default.Lock, null) },
+                        label = { Text("Protect") }
+                    )
+                }
                 NavigationBarItem(
                     selected = selectedTab == 2,
                     onClick = { selectedTab = 2 },
@@ -409,8 +710,9 @@ fun MainScreen(viewModel: MainViewModel = hiltViewModel()) {
         ) {
             when (selectedTab) {
                 0 -> FaceEnrollmentScreen(viewModel)
-                1 -> ProtectScreen(viewModel)
-                2 -> SettingsScreen(viewModel)
+                1 -> if (kidMode) SettingsScreen(viewModel, pendingPaywall) { pendingPaywall = false }
+                     else ProtectScreen(viewModel)
+                2 -> SettingsScreen(viewModel, pendingPaywall) { pendingPaywall = false }
                 3 -> com.shantanu.shield.ui.stats.StatsScreen()
             }
         }
@@ -436,10 +738,14 @@ private fun FirstRunWelcome(
     onFinish: () -> Unit
 ) {
     val context = LocalContext.current
-    val faceEmbedding by viewModel.faceEmbedding.collectAsState(initial = null)
+    // Stale-aware: a face enrolled on an old model doesn't satisfy the first-run gate (forces re-enrol).
+    val faceEnrolled by viewModel.parentFaceEnrolled.collectAsState(initial = false)
     var cameraGranted by remember { mutableStateOf(checkCameraPermission(context)) }
     var usageGranted by remember { mutableStateOf(isUsageStatsPermissionGranted(context)) }
     var overlayGranted by remember { mutableStateOf(Settings.canDrawOverlays(context)) }
+    fun notifOk() = Build.VERSION.SDK_INT < 33 ||
+        ContextCompat.checkSelfPermission(context, "android.permission.POST_NOTIFICATIONS") == PackageManager.PERMISSION_GRANTED
+    var notifGranted by remember { mutableStateOf(notifOk()) }
 
     val lifecycleOwner = LocalLifecycleOwner.current
     DisposableEffect(lifecycleOwner) {
@@ -448,6 +754,7 @@ private fun FirstRunWelcome(
                 cameraGranted = checkCameraPermission(context)
                 usageGranted = isUsageStatsPermissionGranted(context)
                 overlayGranted = Settings.canDrawOverlays(context)
+                notifGranted = notifOk()
             }
         }
         lifecycleOwner.lifecycle.addObserver(obs)
@@ -456,9 +763,11 @@ private fun FirstRunWelcome(
     val cameraLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { cameraGranted = it }
+    val notifLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { notifGranted = it }
 
-    val faceEnrolled = faceEmbedding != null
-    val allDone = faceEnrolled && cameraGranted && usageGranted && overlayGranted
+    val allDone = faceEnrolled && cameraGranted && usageGranted && overlayGranted && notifGranted
 
     Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.surface) {
         Column(
@@ -546,17 +855,30 @@ private fun FirstRunWelcome(
                 }
             )
 
+            if (Build.VERSION.SDK_INT >= 33) {
+                Spacer(Modifier.height(8.dp))
+                SetupTaskRow(
+                    title = "Notifications",
+                    subtitle = "Alerts + the always-on running notice",
+                    done = notifGranted,
+                    actionLabel = if (notifGranted) null else "Grant",
+                    onAction = { notifLauncher.launch("android.permission.POST_NOTIFICATIONS") }
+                )
+            }
+
             Spacer(Modifier.height(32.dp))
+            // First-run is a hard gate: can't proceed until face enrolled + every permission granted.
             Button(
                 onClick = onFinish,
+                enabled = allDone,
                 modifier = Modifier.fillMaxWidth().height(52.dp),
                 shape = RoundedCornerShape(16.dp)
             ) {
-                Text(if (allDone) "Get Started" else "Skip for now")
+                Text("Get Started")
             }
             Spacer(Modifier.height(8.dp))
             Text(
-                "You can revisit setup later in the Settings tab.",
+                if (allDone) "All set — tap Get Started." else "Grant everything above to continue.",
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.outline,
                 textAlign = TextAlign.Center,
@@ -721,24 +1043,43 @@ private fun StatusBanner(viewModel: MainViewModel) {
     }
 }
 
-private enum class SettingsRoute { Hub, KidMode, MultiKid, Paywall, Tamper, Appearance, Permissions, Help }
+private enum class SettingsRoute { Hub, KidMode, MultiKid, ScreenTimeApps, RemoteReport, Paywall, Tamper, Appearance, Permissions, Help }
 
 @Composable
-fun SettingsScreen(viewModel: MainViewModel) {
+fun SettingsScreen(
+    viewModel: MainViewModel,
+    openPaywallSignal: Boolean = false,
+    onPaywallConsumed: () -> Unit = {},
+) {
     var route by remember { mutableStateOf(SettingsRoute.Hub) }
     val coachMarks = com.shantanu.shield.ui.LocalCoachMarks.current
     val requestTab = com.shantanu.shield.ui.LocalRequestTab.current
+    // A gated control on another tab asked for the paywall → land on it.
+    LaunchedEffect(openPaywallSignal) {
+        if (openPaywallSignal) { route = SettingsRoute.Paywall; onPaywallConsumed() }
+    }
     // Scope lives on SettingsScreen, which stays mounted across Hub<->detail
     // navigation (only the inner `route` swaps) — so a delayed tour start here
     // survives returning to the Hub.
     val scope = rememberCoroutineScope()
     val back: () -> Unit = { route = SettingsRoute.Hub }
 
+    CompositionLocalProvider(
+        com.shantanu.shield.ui.LocalRequestPaywall provides { route = SettingsRoute.Paywall }
+    ) {
     when (route) {
-        SettingsRoute.KidMode -> KidModeScreen(viewModel, onBack = back)
+        SettingsRoute.KidMode -> KidModeScreen(viewModel, onBack = back, onOpenMultiKid = { route = SettingsRoute.MultiKid })
         SettingsRoute.MultiKid -> SettingsDetailScreen("Multiple Kids", onBack = back) {
             com.shantanu.shield.ui.profiles.MultiKidSection(viewModel)
         }
+        SettingsRoute.ScreenTimeApps -> SettingsDetailScreen("What counts as screen time", onBack = back) {
+            // ParentGate is the whole point on a kid-owned phone: the parent unlocks with their face,
+            // the child cannot. On a parent-owned phone it's a pass-through.
+            ParentGate {
+                com.shantanu.shield.ui.stats.ScreenTimeAppsSection()
+            }
+        }
+        SettingsRoute.RemoteReport -> com.shantanu.shield.ui.parent.ParentSetupScreen(onBack = back)
         SettingsRoute.Paywall -> com.shantanu.shield.ui.paywall.PaywallScreen(onClose = back)
         SettingsRoute.Tamper -> SettingsDetailScreen("Tamper Protection", onBack = back) {
             TamperProtectionSection(viewModel)
@@ -756,6 +1097,12 @@ fun SettingsScreen(viewModel: MainViewModel) {
                     // Re-arm + jump to Protect; MainScreen's effect starts the tour.
                     viewModel.replayTour(com.shantanu.shield.ui.CoachTours.FIRST_RUN_ID)
                     requestTab?.invoke(1)
+                },
+                onReplayStatsTour = {
+                    // Straight to the full manager rather than replaying the dashboard tour: the
+                    // tour points at the ⋮ on the parent dashboard, which doesn't exist on a
+                    // kid-owned phone. This screen works on both.
+                    route = SettingsRoute.ScreenTimeApps
                 },
                 onReplaySettingsTour = {
                     // Return to the Hub (where the tour targets live), then start.
@@ -775,6 +1122,7 @@ fun SettingsScreen(viewModel: MainViewModel) {
             onNavigate = { route = it },
             onPlusClick = { route = SettingsRoute.Paywall }
         )
+    }
     }
 }
 
@@ -825,7 +1173,10 @@ private fun SettingsHub(
     }
 
     Column(modifier = Modifier.fillMaxSize().verticalScroll(scrollState).padding(20.dp)) {
-        com.shantanu.shield.ui.paywall.PlusEntryCard(onClick = onPlusClick)
+        com.shantanu.shield.ui.paywall.PlusEntryCard(
+            onClick = onPlusClick,
+            promoActive = viewModel.promoActive.collectAsState(initial = true).value,
+        )
         Spacer(Modifier.height(28.dp))
 
         SettingsSectionHeader("Protection")
@@ -849,6 +1200,14 @@ private fun SettingsHub(
                 onClick = { onNavigate(SettingsRoute.MultiKid) }
             )
         }
+        Spacer(Modifier.height(12.dp))
+        SettingsHubRow(
+            icon = Icons.Default.Share,
+            title = "Remote report",
+            subtitle = "See your child's weekly screen time on your phone — private & encrypted",
+            badge = "Beta",
+            onClick = { onNavigate(SettingsRoute.RemoteReport) }
+        )
         Spacer(Modifier.height(12.dp))
         Box(modifier = Modifier.coachTarget("settings-tamper")) {
             SettingsHubRow(
@@ -882,6 +1241,13 @@ private fun SettingsHub(
                 onClick = { onNavigate(SettingsRoute.Permissions) }
             )
         }
+        Spacer(Modifier.height(12.dp))
+        SettingsHubRow(
+            icon = Icons.Default.DateRange,
+            title = "What counts as screen time",
+            subtitle = "Remove clocks, wallpaper carousels and other phone utilities from the charts",
+            onClick = { onNavigate(SettingsRoute.ScreenTimeApps) }
+        )
         Spacer(Modifier.height(12.dp))
         SettingsHubRow(
             icon = Icons.Default.Info,
@@ -1004,10 +1370,10 @@ private fun SettingsDetailScreen(
 @Composable
 private fun AppearanceBody(viewModel: MainViewModel) {
     val themesUnlocked by viewModel.themesUnlocked.collectAsState(initial = false)
-    if (themesUnlocked) {
+    com.shantanu.shield.ui.PremiumGate(themesUnlocked, "Themes", "Subscribe to unlock accent themes.") {
         com.shantanu.shield.ui.theme.ThemePickerSection(viewModel)
-        Spacer(Modifier.height(24.dp))
     }
+    Spacer(Modifier.height(24.dp))
     IntruderFeedbackSection(viewModel)
 }
 
@@ -1039,7 +1405,8 @@ private fun IntruderFeedbackSection(viewModel: MainViewModel) {
 private fun HelpOnboardingSection(
     viewModel: MainViewModel,
     onReplayWelcomeTour: () -> Unit,
-    onReplaySettingsTour: () -> Unit
+    onReplaySettingsTour: () -> Unit,
+    onReplayStatsTour: () -> Unit = {}
 ) {
     Card(
         modifier = Modifier.fillMaxWidth(),
@@ -1092,6 +1459,30 @@ private fun HelpOnboardingSection(
                     Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = null)
                 }
             }
+            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+            Surface(
+                onClick = onReplayStatsTour,
+                color = MaterialTheme.colorScheme.surfaceContainer
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(16.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Icon(Icons.Default.Star, contentDescription = null, modifier = Modifier.size(28.dp))
+                    Spacer(Modifier.width(16.dp))
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("Fix wrong screen time", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                        Spacer(Modifier.height(4.dp))
+                        Text(
+                            "Seeing the Clock, a wallpaper carousel, or another phone utility in " +
+                                "your charts? Choose what counts.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.outline
+                        )
+                    }
+                    Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = null)
+                }
+            }
         }
     }
 }
@@ -1103,7 +1494,7 @@ private fun HelpOnboardingSection(
 // preset selector + custom-app picker + today usage card render below.
 // ============================================================================
 @Composable
-private fun KidModeScreen(viewModel: MainViewModel, onBack: () -> Unit) {
+private fun KidModeScreen(viewModel: MainViewModel, onBack: () -> Unit, onOpenMultiKid: () -> Unit = {}) {
     val ownerType by viewModel.ownerType.collectAsState(initial = "parent")
     val isKidEnabled = ownerType == "kid"
     val lockOwnApp by viewModel.lockOwnApp.collectAsState(initial = false)
@@ -1211,7 +1602,7 @@ private fun KidModeScreen(viewModel: MainViewModel, onBack: () -> Unit) {
             }
             if (isKidEnabled) {
                 Spacer(Modifier.height(24.dp))
-                KidProtectBody(viewModel)
+                KidProtectBody(viewModel, onOpenMultiKid = onOpenMultiKid)
                 Spacer(Modifier.height(24.dp))
             }
         }
@@ -1963,10 +2354,14 @@ private fun FreePlayStartDialog(onDismiss: () -> Unit, onConfirm: (Int) -> Unit)
 }
 
 @Composable
-private fun KidProtectBody(viewModel: MainViewModel) {
+private fun KidProtectBody(viewModel: MainViewModel, onOpenMultiKid: () -> Unit = {}) {
     val context = LocalContext.current
     val dailyLimitMinutes by viewModel.dailyLimitMinutes.collectAsState(initial = 60)
+    // With Multiple Kids on, enforcement uses each kid's OWN limit (set in the Multiple Kids screen);
+    // this single global slider has no effect then, so we redirect instead of showing a dead control.
+    val multiKidEnabled by viewModel.multiKidEnabled.collectAsState(initial = false)
     val preset by viewModel.alwaysAllowedPreset.collectAsState(initial = 0)
+    val presetsUnlocked by viewModel.allowedPresetsUnlocked.collectAsState(initial = true)
     val customAllowed by viewModel.customAlwaysAllowed.collectAsState(initial = emptySet())
     val usedMs by viewModel.screenTimeUsedMs.collectAsState(initial = 0L)
     val extensionsMs by viewModel.extensionsTodayMs.collectAsState(initial = 0L)
@@ -1983,6 +2378,30 @@ private fun KidProtectBody(viewModel: MainViewModel) {
     }
 
     Column(modifier = Modifier.fillMaxWidth()) {
+        // Make the allow-list model explicit: a kid's phone locks EVERYTHING except the always-allowed
+        // apps once the budget runs out (or during a night/schedule lock) — the inverse of the parent
+        // "Protect" tab, which is hidden in Kid Mode. Without this the controlled set is invisible.
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(20.dp),
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer)
+        ) {
+            Row(modifier = Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                Icon(
+                    Icons.Default.Lock,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.onPrimaryContainer
+                )
+                Spacer(Modifier.width(12.dp))
+                Text(
+                    "When the daily budget runs out — and during any night or schedule lock — every app locks " +
+                        "except the always-allowed ones below. Phone and emergency calls always work.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onPrimaryContainer
+                )
+            }
+        }
+        Spacer(Modifier.height(24.dp))
         Text(
             "Daily screen-time budget",
             style = MaterialTheme.typography.titleMedium,
@@ -1995,28 +2414,53 @@ private fun KidProtectBody(viewModel: MainViewModel) {
                 color = MaterialTheme.colorScheme.outline
             )
             Spacer(Modifier.height(12.dp))
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(20.dp),
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer)
-            ) {
-                Column(modifier = Modifier.padding(16.dp)) {
-                    Text(
-                        "${dailyLimitMinutes} min",
-                        style = MaterialTheme.typography.headlineMedium,
-                        color = MaterialTheme.colorScheme.primary,
-                        fontWeight = FontWeight.ExtraBold
-                    )
-                    Spacer(Modifier.height(8.dp))
-                    Slider(
-                        value = dailyLimitMinutes.toFloat(),
-                        onValueChange = { viewModel.setDailyLimitMinutes(it.toInt()) },
-                        valueRange = 15f..240f,
-                        steps = ((240 - 15) / 15) - 1
-                    )
-                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                        Text("15 min", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.outline)
-                        Text("240 min", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.outline)
+            if (multiKidEnabled) {
+                // Multiple Kids on → each child has their own daily limit. Send the parent there so the
+                // change actually takes effect (the global slider is ignored by per-kid enforcement).
+                Card(
+                    onClick = onOpenMultiKid,
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(20.dp),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.tertiaryContainer)
+                ) {
+                    Row(modifier = Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Default.Person, contentDescription = null, tint = MaterialTheme.colorScheme.onTertiaryContainer)
+                        Spacer(Modifier.width(12.dp))
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("Set each kid's limit", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onTertiaryContainer)
+                            Text(
+                                "Multiple Kids is on, so this overall slider doesn't apply. Tap to set each child's daily limit (and grant extra time).",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onTertiaryContainer
+                            )
+                        }
+                        Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = null, tint = MaterialTheme.colorScheme.onTertiaryContainer)
+                    }
+                }
+            } else {
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(20.dp),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer)
+                ) {
+                    Column(modifier = Modifier.padding(16.dp)) {
+                        Text(
+                            "${dailyLimitMinutes} min",
+                            style = MaterialTheme.typography.headlineMedium,
+                            color = MaterialTheme.colorScheme.primary,
+                            fontWeight = FontWeight.ExtraBold
+                        )
+                        Spacer(Modifier.height(8.dp))
+                        Slider(
+                            value = dailyLimitMinutes.toFloat(),
+                            onValueChange = { viewModel.setDailyLimitMinutes(it.toInt()) },
+                            valueRange = 15f..240f,
+                            steps = ((240 - 15) / 15) - 1
+                        )
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                            Text("15 min", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.outline)
+                            Text("240 min", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.outline)
+                        }
                     }
                 }
             }
@@ -2054,14 +2498,15 @@ private fun KidProtectBody(viewModel: MainViewModel) {
                         "C. Custom selection",
                         if (customAllowed.isEmpty()) "Pick any installed Play Store apps below"
                         else "${customAllowed.size} app(s) chosen — tap to edit below",
-                        preset == 2
+                        preset == 2,
+                        locked = !presetsUnlocked
                     ) { viewModel.setAlwaysAllowedPreset(2) }
                 }
             }
 
-            // Custom picker only shows when preset C is selected. It uses the same
-            // `installedApps` list that AppListScreen uses (system apps already excluded).
-            if (preset == 2) {
+            // Custom picker only shows when preset C is selected AND the Custom picker is unlocked.
+            // (Default-free; only hidden if ALLOWED_PRESETS has been converted to premium.)
+            if (preset == 2 && presetsUnlocked) {
                 Spacer(Modifier.height(16.dp))
                 // Note that system apps (phone, messages, settings, camera, clock, etc.)
                 // are always unrestricted in Kid mode and are not shown in this list.
@@ -2344,21 +2789,35 @@ private fun BudgetExtensionCard(extensionMin: Int, onGrant: (Int) -> Unit) {
 }
 
 @Composable
-internal fun PresetOption(title: String, subtitle: String, selected: Boolean, onClick: () -> Unit) {
+internal fun PresetOption(title: String, subtitle: String, selected: Boolean, locked: Boolean = false, onClick: () -> Unit) {
+    // Locked → tapping the row (or radio) opens the paywall instead of selecting it.
+    val openPaywall = com.shantanu.shield.ui.LocalRequestPaywall.current
+    val tap: () -> Unit = if (locked) openPaywall else onClick
     Row(
         modifier = Modifier
             .fillMaxWidth()
             .padding(8.dp)
             .clip(RoundedCornerShape(12.dp))
-            .clickable { onClick() }
+            .clickable { tap() }
             .padding(12.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        RadioButton(selected = selected, onClick = onClick)
+        RadioButton(selected = selected, onClick = tap, enabled = !locked)
         Spacer(Modifier.width(12.dp))
         Column(modifier = Modifier.weight(1f)) {
             Text(title, fontWeight = FontWeight.Bold)
             Text(subtitle, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.outline)
+        }
+        if (locked) {
+            Surface(color = MaterialTheme.colorScheme.tertiaryContainer, shape = RoundedCornerShape(50)) {
+                Text(
+                    "Plus",
+                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp),
+                    style = MaterialTheme.typography.labelSmall,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.onTertiaryContainer
+                )
+            }
         }
     }
 }
@@ -2422,6 +2881,13 @@ fun FaceEnrollmentScreen(
     var isEnrolling by remember { mutableStateOf(false) }
     var enrollmentStatus by remember { mutableStateOf("Position your face") }
 
+    // Release the camera the moment enrolment ends (isEnrolling → false) or the screen leaves composition,
+    // instead of leaving it bound to the Activity lifecycle (the same leak fixed in AppFaceGate).
+    val cameraProviderRef = remember { arrayOfNulls<ProcessCameraProvider>(1) }
+    DisposableEffect(isEnrolling) {
+        onDispose { try { cameraProviderRef[0]?.unbindAll() } catch (_: Exception) {} }
+    }
+
     val cameraPermissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { if (it) isEnrolling = true }
 
     Column(modifier = Modifier.fillMaxSize().padding(20.dp), horizontalAlignment = Alignment.CenterHorizontally) {
@@ -2435,6 +2901,7 @@ fun FaceEnrollmentScreen(
                     val cameraProviderFuture = ProcessCameraProvider.getInstance(ctx)
                     cameraProviderFuture.addListener({
                         val cameraProvider = cameraProviderFuture.get()
+                        cameraProviderRef[0] = cameraProvider   // so onDispose can release the camera
                         val preview = Preview.Builder().build().also { it.setSurfaceProvider(previewView.surfaceProvider) }
                         val imageAnalyzer = ImageAnalysis.Builder().setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST).build().also {
                             it.setAnalyzer(Dispatchers.Default.asExecutor()) { imageProxy ->

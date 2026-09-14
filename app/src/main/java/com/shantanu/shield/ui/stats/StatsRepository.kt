@@ -7,6 +7,8 @@ import android.graphics.drawable.Drawable
 import com.shantanu.shield.data.DataStoreManager
 import com.shantanu.shield.data.FreePlayRecord
 import com.shantanu.shield.data.ProfileSession
+import com.shantanu.shield.util.AppCategorizer
+import com.shantanu.shield.util.AppCategory
 import kotlinx.coroutines.flow.first
 import java.util.Calendar
 import javax.inject.Inject
@@ -293,6 +295,77 @@ class StatsRepository @Inject constructor(
             daysAgo++
         }
         return if (days == 0) 0L else total / days
+    }
+
+    /** Per-app foreground time across the last [days] budget-days (device-wide), merged + sorted desc.
+     *  Used to build the weekly Remote Report's top-apps list in single-kid mode. */
+    fun usageForDays(days: Int, include: (String) -> Boolean = { controlled(it) }): List<AppUsageBucket> {
+        val merged = mutableMapOf<String, Long>()
+        for (i in 0 until days) {
+            val (s, e) = dayWindow(i)
+            for (b in usageInWindow(s, e, include)) {
+                merged[b.packageName] = (merged[b.packageName] ?: 0L) + b.foregroundMs
+            }
+        }
+        return merged.entries
+            .filter { it.value > 0L }
+            .mapNotNull { (pkg, ms) -> resolveBucket(pkg, ms) }
+            .sortedByDescending { it.foregroundMs }
+    }
+
+    /** Per-app foreground time for [sessions] across the last [days] budget-days, merged + sorted desc.
+     *  The per-kid counterpart of [usageForDays] for the multi-kid Remote Report. */
+    fun profileUsageForDays(
+        sessions: List<ProfileSession>,
+        days: Int,
+        include: (String) -> Boolean = { controlled(it) }
+    ): List<AppUsageBucket> {
+        val merged = mutableMapOf<String, Long>()
+        for (i in 0 until days) {
+            val (s, e) = dayWindow(i)
+            for (b in profileUsageInWindow(sessions, s, e, include)) {
+                merged[b.packageName] = (merged[b.packageName] ?: 0L) + b.foregroundMs
+            }
+        }
+        return merged.entries
+            .filter { it.value > 0L }
+            .mapNotNull { (pkg, ms) -> resolveBucket(pkg, ms) }
+            .sortedByDescending { it.foregroundMs }
+    }
+
+    /** Aggregate already-measured usage buckets into per-category totals (sorted by category order),
+     *  for the richer Remote Report. Returns (categoryLabel, ms), positive totals only. */
+    fun categoryTotals(buckets: List<AppUsageBucket>): List<Pair<String, Long>> {
+        val totals = HashMap<AppCategory, Long>()
+        for (b in buckets) {
+            val cat = runCatching {
+                AppCategorizer.categoryOf(pm.getApplicationInfo(b.packageName, 0), b.name)
+            }.getOrDefault(AppCategory.OTHER)
+            totals[cat] = (totals[cat] ?: 0L) + b.foregroundMs
+        }
+        return totals.entries
+            .filter { it.value > 0L }
+            .sortedBy { it.key.order }
+            .map { it.key.label to it.value }
+    }
+
+    /** 24 hour-of-day buckets of controlled-app usage over the last [days] budget-days (device-wide). */
+    fun hourlyControlledMs(days: Int, include: (String) -> Boolean = { controlled(it) }): LongArray {
+        val (start, _) = dayWindow(days - 1)
+        val end = System.currentTimeMillis()
+        return com.shantanu.shield.util.UsageMeasure.hourlyForegroundMs(
+            com.shantanu.shield.util.UsageMeasure.eventsIn(usm, start, end), end, include)
+    }
+
+    /** Controlled-app session count + longest session over the last [days] budget-days (device-wide). */
+    fun sessionStatsForDays(
+        days: Int,
+        include: (String) -> Boolean = { controlled(it) }
+    ): com.shantanu.shield.util.UsageMeasure.SessionStats {
+        val (start, _) = dayWindow(days - 1)
+        val end = System.currentTimeMillis()
+        return com.shantanu.shield.util.UsageMeasure.sessionStats(
+            com.shantanu.shield.util.UsageMeasure.eventsIn(usm, start, end), end, include)
     }
 
     // Resolve a package's label + icon into a bucket. App-set filtering happens at the

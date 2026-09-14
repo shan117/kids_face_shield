@@ -37,12 +37,16 @@ class MainViewModel @Inject constructor(
 
     val protectedApps = dataStoreManager.protectedApps
     val faceEmbedding = dataStoreManager.faceEmbedding
+    // Stale-aware enrolment (SFace migration): false when the stored embedding belongs to an old model.
+    val parentFaceEnrolled = dataStoreManager.parentFaceEnrolled
     val lockMessageType = dataStoreManager.lockMessageType
     val lockDeviceSettings = dataStoreManager.lockDeviceSettings
     val lockOwnApp = dataStoreManager.lockOwnApp
 
     // ---- Kid Mode + Screen Time flows (Phase 2) ----
     val ownerType = dataStoreManager.ownerType
+    // "none" / "child" / "parent" — drives the child-device shell (dashboard by default, parent face to manage).
+    val remoteRole = dataStoreManager.remoteRole
     val dailyLimitMinutes = dataStoreManager.dailyLimitMinutes
     val alwaysAllowedPreset = dataStoreManager.alwaysAllowedPreset
     val customAlwaysAllowed = dataStoreManager.customAlwaysAllowed
@@ -58,6 +62,8 @@ class MainViewModel @Inject constructor(
     val kidProfiles = dataStoreManager.kidProfiles
     val kidFaceEmbeddings = dataStoreManager.kidFaceEmbeddings
     val multiKidUnlocked = entitlements.isUnlocked(Feature.MULTI_KID_PROFILES)
+    // Default-free, but convertible to premium via config: gates the Custom allow-list picker (preset C).
+    val allowedPresetsUnlocked = entitlements.isUnlocked(Feature.ALLOWED_PRESETS)
     /** profileId -> (package -> daily-limit minutes), for Multiple-kids per-app caps. */
     val kidPerAppLimits = dataStoreManager.kidPerAppLimits
 
@@ -86,6 +92,8 @@ class MainViewModel @Inject constructor(
     // ---- Theme accent (Phase 7) ----
     val themeAccent = dataStoreManager.themeAccent
     val themesUnlocked = entitlements.isUnlocked(Feature.THEMES)
+    // Promo on = free-for-all period (hub hero + copy reflect it); off = paid mode.
+    val promoActive = entitlements.config.map { it.promoActive }
     fun setThemeAccent(key: String) {
         viewModelScope.launch { dataStoreManager.setThemeAccent(key) }
     }
@@ -367,8 +375,9 @@ class MainViewModel @Inject constructor(
         viewModelScope.launch { dataStoreManager.markTourSeen(tourId) }
     }
 
+    /** Re-arm just [tourId], so replaying one tour doesn't also re-trigger the others. */
     fun replayTour(tourId: String) {
-        viewModelScope.launch { dataStoreManager.resetSeenTours() }
+        viewModelScope.launch { dataStoreManager.unmarkTourSeen(tourId) }
     }
 }
 

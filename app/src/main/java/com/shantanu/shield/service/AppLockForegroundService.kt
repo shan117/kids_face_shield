@@ -32,13 +32,29 @@ import com.shantanu.shield.overlay.FaceLockOverlayContent
 import dagger.hilt.android.AndroidEntryPoint
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.collect
+import com.shantanu.shield.premium.EntitlementRepository
+import com.shantanu.shield.premium.Feature
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.combine
+import com.shantanu.shield.remote.CommandType
+import com.shantanu.shield.remote.RemoteCommandApplier
+import com.shantanu.shield.remote.RemoteCommandRepository
+import com.shantanu.shield.remote.RemoteReportSync
+import com.shantanu.shield.remote.Sealed
 import javax.inject.Inject
 
 @AndroidEntryPoint
 class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOwner {
 
     @Inject lateinit var dataStoreManager: DataStoreManager
+    @Inject lateinit var entitlementRepository: EntitlementRepository
+    @Inject lateinit var remoteCommandRepository: RemoteCommandRepository
+    @Inject lateinit var remoteCommandApplier: RemoteCommandApplier
+    @Inject lateinit var remoteReportSync: RemoteReportSync
+
+    // Live Firestore listener for parent→child commands (Remote Control); null unless this is a paired,
+    // control-enabled child. Re-attached on state change; removed in onDestroy.
+    private var commandListener: com.google.firebase.firestore.ListenerRegistration? = null
     private val serviceScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
     
     private lateinit var windowManager: WindowManager
@@ -51,6 +67,21 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
     private var isLockActive: Boolean = false
     private var lockingPackage: String? = null
     private var lockingPackageEventTime: Long = 0L
+
+    // Persistent remote parent-lock. While true the device stays locked across ALL apps — the monitor
+    // loop re-asserts the lock on every foreground change so Recents/Home can't slip past the overlay.
+    // Cleared by a successful (parent) face auth or a remote UNLOCK command.
+    @Volatile private var remoteLockActive = false
+    // When true the remote lock is FULL — it also covers Phone & Messages. Default leaves them usable for
+    // emergency safety. Set per-command from LOCK_NOW's arg; reset on UNLOCK.
+    @Volatile private var remoteLockFull = false
+    // True while a local "unlock with parent's face" scan is running on the parent-lock overlay. The camera
+    // is on only during this window; the monitor loop pauses all overlay management so the one-shot scan
+    // isn't torn down mid-capture.
+    @Volatile private var parentFaceScanActive = false
+    // Default dialer + SMS packages (resolved per-OEM at runtime), exempted from a normal remote lock.
+    private var dialerPackage: String? = null
+    private var smsPackage: String? = null
 
     // Cached Device-Admin state. `DevicePolicyManager.isAdminActive` is a synchronous IPC to the
     // system_server and was previously invoked on every package change AND every 250 ms watchdog
@@ -74,7 +105,25 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
     // per-kid per-app cap can be evaluated without a per-decision UsageStats rescan.
     @Volatile private var perProfileAppUsageMs: Map<String, Map<String, Long>> = emptyMap()
 
-    private fun isFreePlayActive(): Boolean = System.currentTimeMillis() < cachedKidSessionEndAtMs
+    // Premium entitlement gates (B3). Default TRUE = permissive: during the promo (everything
+    // unlocked) and before the first emission, premium enforcement is unchanged. When billing flips
+    // to paid and the user isn't premium, these go false and the matching premium *enforcement*
+    // stops. Core safety (app lock, single-kid budget, night lock) is hardcoded-free and NEVER gated.
+    @Volatile private var multiKidUnlocked: Boolean = true
+    @Volatile private var perAppLimitsUnlocked: Boolean = true
+    @Volatile private var newAppUnlocked: Boolean = true
+    // Default-free features that can be converted to premium via config (default true = free).
+    @Volatile private var nightLockUnlocked: Boolean = true
+    @Volatile private var kidBudgetUnlocked: Boolean = true
+    @Volatile private var freePlayUnlocked: Boolean = true
+    @Volatile private var tamperUnlocked: Boolean = true
+    // APP_LOCK: the core parent-mode per-app face lock. Gating it = the whole app can be made paid.
+    @Volatile private var appLockUnlocked: Boolean = true
+
+    // Gated by the FREE_PLAY entitlement: when locked (premium, non-subscriber), Free Play no longer
+    // bypasses locks — i.e. the feature is off. Default true = free.
+    private fun isFreePlayActive(): Boolean =
+        freePlayUnlocked && System.currentTimeMillis() < cachedKidSessionEndAtMs
 
     private fun isAdminActiveCached(): Boolean {
         val now = android.os.SystemClock.elapsedRealtime()
@@ -97,12 +146,20 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
     // watchdog doesn't try to re-launch it. It is cleared when LockActivity reports its result.
     private var activityLockActive: Boolean = false
     private var activityLockPackage: String? = null
+    @Volatile private var kidModeLockShown = false   // current overlay is a kid budget/night lock (auto-clears)
 
     private var overlayLifecycleOwner: OverlayLifecycleOwner? = null
 
     private val REAUTH_INTERVAL_MS = 60 * 1000L
     private val POLLING_INTERVAL_MS = 250L
     private val SCREEN_TIME_POLL_INTERVAL_MS = 60_000L
+    // Child auto-sync: while the service runs, re-upload the report at most this often so the parent's live
+    // view stays fresh without a manual "Sync now". syncNow() is gated (no-ops unless child + share-on + paired).
+    private val AUTO_REPORT_SYNC_INTERVAL_MS = 30 * 60_000L
+    @Volatile private var lastAutoReportSyncMs = 0L
+    // Debounce app install/uninstall bursts (e.g. a restore installs dozens at once) into a single upload.
+    private val APP_CHANGE_SYNC_DEBOUNCE_MS = 10_000L
+    private var appChangeSyncJob: Job? = null
     
     private var monitorJob: Job? = null
     private var screenTimePollJob: Job? = null
@@ -111,10 +168,17 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
     // manifest one) that locks each newly-installed app and notifies the parent.
     private val packageAddedReceiver = object : android.content.BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
-            if (intent.action != Intent.ACTION_PACKAGE_ADDED) return
-            if (intent.getBooleanExtra(Intent.EXTRA_REPLACING, false)) return  // an update, not a new install
+            val action = intent.action
+            if (action != Intent.ACTION_PACKAGE_ADDED && action != Intent.ACTION_PACKAGE_REMOVED) return
+            if (intent.getBooleanExtra(Intent.EXTRA_REPLACING, false)) return  // an update, not a new install/removal
             val pkg = intent.data?.schemeSpecificPart ?: return
-            serviceScope.launch { handleNewAppInstalled(pkg) }
+            // The device-truth utility checks (launcher icon / clock + home role) are cached per
+            // package; the set of installed packages just changed, so drop the cache.
+            com.shantanu.shield.util.AllowedApps.clearPackageCaches()
+            if (action == Intent.ACTION_PACKAGE_ADDED) serviceScope.launch { handleNewAppInstalled(pkg) }
+            // The child's installed-app list changed → re-upload so the parent's picker stays current. Debounced
+            // so a burst (restore / bulk update) collapses to one upload. syncNow() is gated (child + share-on).
+            scheduleAppChangeSync()
         }
     }
     private val launcherPackages = mutableSetOf<String>()
@@ -187,6 +251,8 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
         windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
         loadLauncherPackages()
         loadSettingsPackages()
+        dialerPackage = com.shantanu.shield.util.AllowedApps.resolveDefaultPhonePackage(this)
+        smsPackage = com.shantanu.shield.util.AllowedApps.resolveDefaultSmsPackage(this)
         createNotificationChannel()
         try {
             startForeground(NOTIFICATION_ID, createNotification(), ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
@@ -195,16 +261,52 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
         }
         startAppMonitoring()
         startScreenTimePolling()
+        // File-based health heartbeat (Realme logcat is suppressed) — diagnoses the multi-day freeze.
+        com.shantanu.shield.util.Diag.start(this)
         androidx.core.content.ContextCompat.registerReceiver(
             this,
             packageAddedReceiver,
-            android.content.IntentFilter(Intent.ACTION_PACKAGE_ADDED).apply { addDataScheme("package") },
+            android.content.IntentFilter(Intent.ACTION_PACKAGE_ADDED).apply {
+                addAction(Intent.ACTION_PACKAGE_REMOVED)
+                addDataScheme("package")
+            },
             androidx.core.content.ContextCompat.RECEIVER_NOT_EXPORTED
         )
         // Keep the Free-Play cache in lock-step with DataStore so the lock decision
         // path can answer synchronously. Collector exits when the service does.
         // Also: post Free-Play start/end notifications by watching for transitions,
         // and schedule the "ended" notification via a coroutine timer.
+        // Premium entitlement gates: revoke premium *enforcement* when paid mode is on and the user
+        // isn't premium. Permissive (true) during the promo. Core safety is never affected.
+        serviceScope.launch { entitlementRepository.isUnlocked(Feature.MULTI_KID_PROFILES).collect { multiKidUnlocked = it } }
+        serviceScope.launch { entitlementRepository.isUnlocked(Feature.PER_APP_LIMITS).collect { perAppLimitsUnlocked = it } }
+        serviceScope.launch { entitlementRepository.isUnlocked(Feature.NEW_APP_AUTO_BLOCK).collect { newAppUnlocked = it } }
+        serviceScope.launch { entitlementRepository.isUnlocked(Feature.NIGHT_LOCK).collect { nightLockUnlocked = it } }
+        serviceScope.launch { entitlementRepository.isUnlocked(Feature.KID_BUDGET).collect { kidBudgetUnlocked = it } }
+        serviceScope.launch { entitlementRepository.isUnlocked(Feature.FREE_PLAY).collect { freePlayUnlocked = it } }
+        serviceScope.launch { entitlementRepository.isUnlocked(Feature.TAMPER).collect { tamperUnlocked = it } }
+        serviceScope.launch { entitlementRepository.isUnlocked(Feature.APP_LOCK).collect { appLockUnlocked = it } }
+
+        // Remote Control: while the child has it enabled AND is paired, listen for parent→child commands
+        // and apply them (grant time / set limit via DataStore here; LOCK_NOW via the lock path below).
+        // E2E — a command only applies if it decrypts under the pairing key. See PARENT_REMOTE_CONTROL_PLAN.md.
+        serviceScope.launch {
+            combine(
+                dataStoreManager.remoteRole,
+                dataStoreManager.remotePairingId,
+                dataStoreManager.remoteControlEnabled,
+            ) { role, pairingId, enabled -> Triple(role, pairingId, enabled) }
+                .collect { (role, pairingId, enabled) ->
+                    commandListener?.remove()
+                    commandListener = null
+                    if (role == "child" && pairingId.isNotBlank() && enabled) {
+                        commandListener = remoteCommandRepository.listen(pairingId) { sealed ->
+                            serviceScope.launch { onRemoteCommand(sealed) }
+                        }
+                    }
+                }
+        }
+
         serviceScope.launch {
             var firstEmission = true
             var previousEndAt = 0L
@@ -239,10 +341,25 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
             val usageStatsManager = getSystemService(Context.USAGE_STATS_SERVICE) as UsageStatsManager
             Log.d("AppLock", "App monitoring started.")
             while (isActive) {
+                com.shantanu.shield.util.Diag.onPoll()
+                // A local parent-face unlock scan is running: pause all overlay management so the one-shot
+                // camera capture isn't recreated/torn down mid-scan. Resolves via onAuthenticated (unlock)
+                // or onParentFaceScan(false) (cancel / 20s timeout).
+                if (parentFaceScanActive) {
+                    runWatchdog()
+                    delay(POLLING_INTERVAL_MS)
+                    continue
+                }
                 val scan = scanRecentEvents(usageStatsManager)
-                if (scan.lockedAppExited) {
+                // Skip the normal "locked app went to background → hide" teardown while a remote lock is
+                // active: the dedicated manager below owns the overlay then. Showing the camera overlay over
+                // a *real* foreground app (e.g. the dialer) churns that app's UsageStats FG/BG events, so
+                // lockedAppExited would otherwise flip true every poll and thrash the overlay (create/destroy
+                // ~every 250ms) — leaving Phone usable under full lock.
+                if (scan.lockedAppExited && !remoteLockActive) {
                     Log.d("AppLock", "Locked app '$lockingPackage' went to background. Clearing session.")
-                    if (isLockActive) armedPackage = lockingPackage
+                    // Now that it's background, the kill lands → stops playback + stales its recents thumbnail.
+                    if (isLockActive) { armedPackage = lockingPackage; lockingPackage?.let { killLockedApp(it) } }
                     currentlyUnlockedPackage = null
                     lastAuthTime = 0
                     hideOverlay()
@@ -266,7 +383,55 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
                     // class — class is not consulted for non-Settings packages anyway.
                     handlePackageChange(armed, null, System.currentTimeMillis())
                 }
+                // Persistent parent lock manager: while active, hold the overlay over whatever's foreground
+                // and re-show it the instant Recents/Home dismissed it. Cleared by parent face / remote
+                // UNLOCK only, so the kid can't navigate out of it. `isLockActive` is set synchronously by
+                // showOverlay/hideOverlay, so it's a stable signal here — we show once and leave it up
+                // (no per-poll recreate → no thrash).
+                if (remoteLockActive) {
+                    val pkg = scan.latestPkg ?: currentForegroundPackage ?: packageName
+                    // Default remote lock leaves Phone & Messages usable (emergency safety); a FULL lock
+                    // covers them too. The platform emergency dialer is a secure system UI above app
+                    // overlays, so true emergency calls remain possible either way.
+                    val isPhoneOrSms = pkg == dialerPackage || pkg == smsPackage
+                    val shouldBlock = remoteLockFull || !isPhoneOrSms
+                    if (shouldBlock && !isLockActive) {
+                        enforceLock(pkg, System.currentTimeMillis(), forceActivity = false, isKidModeLock = true, lockedByParent = true)
+                    } else if (!shouldBlock && isLockActive) {
+                        // Default lock + Phone/SMS in the foreground → let it through (hide the overlay).
+                        hideOverlay()
+                    }
+                }
                 runWatchdog()
+                // Auto-clear a kid budget/night lock the moment it no longer applies (e.g. parent granted extra
+                // time, limit raised, or night window ended) — without this the overlay stays up over the app.
+                if (isLockActive && kidModeLockShown && !remoteLockActive && !activityLockActive) {
+                    val lp = lockingPackage
+                    if (lp != null && !shouldLockForKidMode(lp, System.currentTimeMillis())) {
+                        Log.d("AppLock", "Kid lock cleared for $lp (budget/night no longer applies).")
+                        isLockActive = false
+                        currentlyUnlockedPackage = null
+                        armedPackage = null
+                        hideOverlay()
+                    }
+                }
+                // Orphan reconcile: an overlay is still attached but NO lock is wanted (state desynced by a
+                // teardown race). Left alone, this full-screen touchable window eats every tap = frozen phone.
+                // We still hold its reference, so remove it. (No-op in the common case — overlayView is null.)
+                if (overlayView != null && !isLockActive && !remoteLockActive &&
+                    !activityLockActive && !parentFaceScanActive
+                ) {
+                    Log.w("AppLock", "Orphan overlay detected with no active lock — removing.")
+                    hideOverlay()
+                }
+                // Keep media suppressed while a lock is up or armed (covers minimize→background/PiP playback,
+                // incl. Premium audio). Re-grab if the app clawed focus back and restarted (isMusicActive).
+                val lockSuppress = isLockActive || remoteLockActive || armedPackage != null
+                if (lockSuppress) {
+                    if (!audioFocusHeld || audioManager.isMusicActive) grabAudioFocus()
+                } else if (audioFocusHeld) {
+                    releaseAudioFocus()
+                }
                 delay(POLLING_INTERVAL_MS)
             }
         }
@@ -291,11 +456,31 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
             while (isActive) {
                 try {
                     pollScreenTime()
+                    maybeAutoSyncReport()
                 } catch (t: Throwable) {
                     Log.e("ScreenTime", "poll failed: ${t.message}", t)
                 }
                 delay(SCREEN_TIME_POLL_INTERVAL_MS)
             }
+        }
+    }
+
+    // Rate-limited background report upload (child side). Set the timestamp before syncing so a failure
+    // (offline) doesn't retry every 60 s — the periodic worker + after-command sync cover the gaps.
+    private suspend fun maybeAutoSyncReport() {
+        val now = System.currentTimeMillis()
+        if (now - lastAutoReportSyncMs < AUTO_REPORT_SYNC_INTERVAL_MS) return
+        lastAutoReportSyncMs = now
+        remoteReportSync.syncNow()
+    }
+
+    // App install/uninstall → re-upload, but coalesced: each event restarts a short timer, so a burst of
+    // changes (a restore, a bulk update) results in ONE upload once things settle. Gated inside syncNow().
+    private fun scheduleAppChangeSync() {
+        appChangeSyncJob?.cancel()
+        appChangeSyncJob = serviceScope.launch {
+            delay(APP_CHANGE_SYNC_DEBOUNCE_MS)
+            remoteReportSync.syncNow()
         }
     }
 
@@ -311,6 +496,7 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
         if (todayKey != lastReset) {
             dataStoreManager.setScreenTimeUsedMs(0L)
             dataStoreManager.setExtensionsTodayMs(0L)
+            dataStoreManager.resetAllProfileExtensions()   // multi-kid: clear per-kid grants too
             dataStoreManager.setScreenTimeLastResetDate(todayKey)
             Log.d("ScreenTime", "Daily reset: used + extensions zeroed for $todayKey")
         }
@@ -402,7 +588,12 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
             profs to appUsage
         }
         perProfileAppUsageMs = result.second
-        if (result.first != profiles) dataStoreManager.setKidProfiles(result.first)
+        // Write ONLY usedMs, atomically re-reading the current profiles inside the edit — never a full
+        // rewrite from this stale snapshot, or a concurrent extension grant (extensionsMs) would be
+        // clobbered back to its pre-grant value, silently re-locking the kid.
+        if (result.first != profiles) {
+            dataStoreManager.updateProfileUsedMs(result.first.associate { it.id to it.usedMs })
+        }
     }
 
     // Most-recent 07:00 boundary: today's 07:00 if we're past it, else yesterday's 07:00.
@@ -475,7 +666,7 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
                 // Per-app cap for THIS kid — checked before the allowed bypass, so a cap can
                 // override an otherwise-allowed app (mirrors the single-kid ordering below).
                 val kidLimits = dataStoreManager.kidPerAppLimits.first()[active.id].orEmpty()
-                if (kidLimits.isNotEmpty() &&
+                if (perAppLimitsUnlocked && kidLimits.isNotEmpty() &&
                     com.shantanu.shield.kid.PerAppLimits.isOver(pkg, perProfileAppUsageMs[active.id].orEmpty(), kidLimits)
                 ) return true
                 // This kid's own allowed apps are free (never locked, don't count).
@@ -487,7 +678,7 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
                     usedMs = active.usedMs,
                     dailyLimitMinutes = active.dailyLimitMinutes,
                     extensionsMs = active.extensionsMs,
-                    isNight = isNightWindow(nowMs)
+                    isNight = nightLockUnlocked && isNightWindow(nowMs)
                 )
             }
             // Stale identity (both kids enrolled): any kid's allowed app opens without a scan (so
@@ -500,7 +691,7 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
         // independent of the overall budget. Applies before the allowed-set bypass, so a parent can
         // cap even an otherwise-allowed app. (Multi-kid per-app limits are a later add.)
         val perAppLimits = dataStoreManager.perAppLimits.first()
-        if (perAppLimits.isNotEmpty() &&
+        if (perAppLimitsUnlocked && perAppLimits.isNotEmpty() &&
             com.shantanu.shield.kid.PerAppLimits.isOver(pkg, perAppUsageMs, perAppLimits)) return true
 
         // Single-kid: always-allowed apps (Phone/SMS/WhatsApp/custom) are never locked, so emergency
@@ -508,16 +699,39 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
         val allowed = com.shantanu.shield.util.AllowedApps.computeAlwaysAllowedSet(this, dataStoreManager)
         if (pkg in allowed) return false
 
-        // Hard lock during the configured night window — irrespective of budget.
-        if (isNightWindow(nowMs)) return true
+        // Hard lock during the configured night window — gated by the NIGHT_LOCK entitlement.
+        if (nightLockUnlocked && isNightWindow(nowMs)) return true
 
-        // Budget-exhausted check (day window only).
+        // Budget-exhausted check (day window only) — gated by the KID_BUDGET entitlement.
+        if (!kidBudgetUnlocked) return false
         val limit = dataStoreManager.dailyLimitMinutes.first()
         val used = dataStoreManager.screenTimeUsedMs.first()
         val extensions = dataStoreManager.extensionsTodayMs.first()
         val usedMin = (used / 60_000L).toInt()
         val extensionMin = (extensions / 60_000L).toInt()
         return usedMin >= limit + extensionMin
+    }
+
+    /**
+     * Today's (usedMs, effectiveLimitMs) for whoever the budget currently applies to — the identified
+     * kid under Multiple-kids, otherwise the single-kid counters. The effective limit includes any
+     * parent-granted extension, exactly as [shouldLockForKidMode] computes it, so the figures on the
+     * lock screen can never contradict the decision that raised it.
+     *
+     * Returns (0, 0) when no budget applies (no identified kid) — the overlay then renders as before.
+     */
+    private suspend fun kidBudgetSnapshot(nowMs: Long): Pair<Long, Long> {
+        if (isMultiKidActive()) {
+            val activeId = com.shantanu.shield.kid.MultiKidEnforcement.activeProfileId(
+                dataStoreManager.profileSessions.first(), nowMs
+            )
+            val active = dataStoreManager.kidProfiles.first().firstOrNull { it.id == activeId }
+                ?: return 0L to 0L
+            return active.usedMs to (active.dailyLimitMinutes * 60_000L + active.extensionsMs)
+        }
+        val limitMs = dataStoreManager.dailyLimitMinutes.first() * 60_000L +
+            dataStoreManager.extensionsTodayMs.first()
+        return dataStoreManager.screenTimeUsedMs.first() to limitMs
     }
 
     private fun isNightWindow(nowMs: Long): Boolean {
@@ -535,7 +749,8 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
     // two faces exist, this is false → the device falls back to single-kid (and the UI prompts the
     // parent to finish enrolment). So a half-configured multi-kid never half-works.
     private suspend fun isMultiKidActive(): Boolean =
-        dataStoreManager.multiKidEnabled.first() && dataStoreManager.kidFaceEmbeddings.first().size >= 2
+        multiKidUnlocked &&
+        dataStoreManager.multiKidEnabled.first() && dataStoreManager.kidFacesEnrolled(2).first()
 
     // Union of every kid's allow-list — apps that bypass the identify camera, so any kid's allowed
     // app (and emergency comms) opens without a scan while no kid is identified yet.
@@ -569,7 +784,10 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
     }
 
     private fun runWatchdog() {
-        val pkg = currentForegroundPackage ?: return
+        // Fall back to the armed package: after a locked app is backgrounded, currentForegroundPackage is
+        // cleared; if the kid re-opens it from recents before the (laggy) foreground event lands, this still
+        // re-asserts the lock instead of leaving a gap where the app is visible without the overlay.
+        val pkg = currentForegroundPackage ?: armedPackage ?: return
         val cls = currentForegroundClass
         if (pkg == this.packageName) return
         if (isLockActive) return
@@ -580,13 +798,13 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
             val protectedApps = effectiveProtectedApps()
             val isCriticalSideDoor = isCriticalSettingsClass(pkg, cls)
             val adminActive = isAdminActiveCached()
-            val challengeCritical = isCriticalSideDoor && adminActive
+            val challengeCritical = isCriticalSideDoor && adminActive && tamperUnlocked
             val kidModeLock = shouldLockForKidMode(pkg, System.currentTimeMillis())
             val freePlayActive = isFreePlayActive()
             val shouldLock = when {
                 challengeCritical -> true
                 freePlayActive -> false
-                protectedApps.contains(pkg) && !isSettingsSubPage(pkg, cls) -> true
+                appLockUnlocked && protectedApps.contains(pkg) && !(isSettingsSubPage(pkg, cls) && settingsSessionActive(pkg)) -> true
                 kidModeLock -> true
                 else -> false
             }
@@ -598,7 +816,7 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
             val identifyMode = kidModeLock && isIdentifyLock(pkg, System.currentTimeMillis())
             Log.d("AppLock", "Watchdog: $pkg foreground without overlay (critical=$challengeCritical kid=$kidModeLock identify=$identifyMode). Forcing show.")
             withContext(Dispatchers.Main) {
-                if (!isLockActive) enforceLock(pkg, System.currentTimeMillis(), forceActivity = kidModeLock, isKidModeLock = kidModeLock, identifyMode = identifyMode)
+                if (!isLockActive) enforceLock(pkg, System.currentTimeMillis(), forceActivity = false, isKidModeLock = kidModeLock, identifyMode = identifyMode)
             }
         }
     }
@@ -713,7 +931,7 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
             // get locked whenever Device Admin is active, even if the general Settings lock toggle
             // is off — they are the only two doors the user could otherwise walk through to remove
             // our protection.
-            val challengeCritical = isCriticalSideDoor && adminActive
+            val challengeCritical = isCriticalSideDoor && adminActive && tamperUnlocked
             val kidModeLock = shouldLockForKidMode(packageName, System.currentTimeMillis())
             val freePlayActive = isFreePlayActive()
             val freePlaySelfLock = freePlayActive && packageName == this@AppLockForegroundService.packageName
@@ -721,7 +939,7 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
                 challengeCritical -> true
                 freePlaySelfLock -> true
                 freePlayActive -> false
-                protectedApps.contains(packageName) && !isSettingsSubPage(packageName, className) -> true
+                appLockUnlocked && protectedApps.contains(packageName) && !(isSettingsSubPage(packageName, className) && settingsSessionActive(packageName)) -> true
                 kidModeLock -> true
                 else -> false
             }
@@ -732,7 +950,7 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
                     if (kidModeLock) Log.d("AppLock", "Kid Mode lock fired for $packageName")
                     if (freePlaySelfLock) Log.d("AppLock", "Free-Play self-lock fired for $packageName")
                     val identifyMode = kidModeLock && isIdentifyLock(packageName, System.currentTimeMillis())
-                    enforceLock(packageName, eventTime, forceActivity = kidModeLock, isKidModeLock = kidModeLock, identifyMode = identifyMode)
+                    enforceLock(packageName, eventTime, forceActivity = false, isKidModeLock = kidModeLock, identifyMode = identifyMode)
                 }
             } else if (!protectedApps.contains(packageName)) {
                 // Leaving protected app to an unprotected one (or skipping a bypassable sub-page).
@@ -753,6 +971,15 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
     //   4. Home classes were resolved and this class is not among them.
     // Critical classes (App Details, Device Admin Apps) ALWAYS short-circuit this to false so
     // they remain lockable. If home resolution failed at startup, fall back to locking (safer).
+    // A Settings sub-page is only bypassable as a *continuation* of an already-unlocked Settings session
+    // (navigating inside Settings after the face check). Cold-opening straight to a sub-page (OEMs reopen
+    // Settings to the last screen) is NOT a session → still locks. Closes the "first tap locks, later taps
+    // land on a sub-page and skip" hole.
+    private fun settingsSessionActive(packageName: String): Boolean =
+        settingsPackages.contains(packageName) &&
+        currentlyUnlockedPackage == packageName &&
+        (System.currentTimeMillis() - lastAuthTime) < REAUTH_INTERVAL_MS
+
     private fun isSettingsSubPage(packageName: String, className: String?): Boolean {
         if (!settingsPackages.contains(packageName)) return false
         if (className == null) return false
@@ -772,11 +999,66 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
 
     // Choose the enforcement mechanism: a full-screen Activity for targets that force-hide
     // overlay windows (Settings), and the lightweight overlay for everything else.
-    // forceActivity=true is used by Kid Mode locks. The overlay path can be partially bypassed
-    // on some OEMs (system gestures, the brief gap between Home → re-open recents → re-foreground),
-    // so kid-mode goes through the same robust full-screen LockActivity the system Settings lock
-    // uses. Back/Home from LockActivity sends the user Home and re-arms the lock on next entry.
-    private fun enforceLock(packageName: String, eventTime: Long, forceActivity: Boolean = false, isKidModeLock: Boolean = false, identifyMode: Boolean = false) {
+    // Kid Mode locks use the OVERLAY (forceActivity=false), NOT a full-screen Activity: a
+    // background Activity launch is blocked on Android 12+/many OEMs (RealmeUI 15) once the
+    // ~10s post-foreground grace window expires, so the budget/night lock would silently never
+    // appear. The overlay (TYPE_APPLICATION_OVERLAY, granted SYSTEM_ALERT_WINDOW) is not subject
+    // to background-activity-launch limits, and the watchdog re-asserts it every poll if a system
+    // gesture dismisses it — covering the partial-bypass case the Activity was meant to solve.
+    // Route an applied remote command to the lock UI. Budget commands (grant/limit) are already applied in
+    // the applier; only the lock actions need the service. LOCK_NOW reuses the parent-face kid-mode lock.
+    private suspend fun onRemoteCommand(sealed: Sealed) {
+        val applied = remoteCommandApplier.apply(sealed) ?: return
+        when (applied.type) {
+            CommandType.LOCK_NOW -> {
+                // Persistent parent lock: set the flags so the monitor loop re-asserts it on every app
+                // switch (Recents/Home can't slip past it), then show it now. Drawn as an overlay because a
+                // background full-screen Activity is blocked on Android 12+/many OEMs (RealmeUI 15).
+                // arg == LOCK_FLAG_FULL → also cover Phone & Messages; otherwise they stay usable (safety).
+                remoteLockActive = true
+                remoteLockFull = applied.arg == com.shantanu.shield.remote.RemoteCommand.LOCK_FLAG_FULL
+                val pkg = currentForegroundPackage ?: packageName
+                enforceLock(pkg, System.currentTimeMillis(), forceActivity = false, isKidModeLock = true, lockedByParent = true)
+            }
+            CommandType.UNLOCK -> {
+                // Remote release: clear the persistent flags and drop the overlay.
+                remoteLockActive = false
+                remoteLockFull = false
+                parentFaceScanActive = false
+                isLockActive = false
+                hideOverlay()
+            }
+            // Budget/config commands are applied to DataStore in the applier. Re-upload the report so the
+            // parent's live listener reflects the change at once, instead of waiting for the periodic sync.
+            CommandType.GRANT_EXTRA_TIME, CommandType.SET_DAILY_LIMIT,
+            CommandType.SET_ALLOWED_PRESET, CommandType.SET_AUTO_BLOCK,
+            CommandType.SET_CUSTOM_ALLOWED, CommandType.SET_PER_APP_LIMIT ->
+                serviceScope.launch { remoteReportSync.syncNow() }
+        }
+    }
+
+    // Tap-to-start local parent-face unlock on the parent-lock overlay. The camera is bound only for the
+    // duration of a scan; the monitor loop is paused (parentFaceScanActive) so the one-shot capture isn't
+    // recreated/torn down mid-scan. On end (cancel/timeout) we drop the overlay so CameraX is released
+    // (lifecycle destroy) BEFORE the FGS camera-type downgrade — then the monitor re-shows it camera-free.
+    private fun onParentFaceScan(active: Boolean) {
+        parentFaceScanActive = active
+        if (active) {
+            updateForegroundService(useCamera = true)   // Android 14+ needs CAMERA-FGS to open the camera
+        } else {
+            hideOverlay()   // releases the camera + schedules the safe FGS downgrade; monitor re-shows
+        }
+    }
+
+    private fun enforceLock(packageName: String, eventTime: Long, forceActivity: Boolean = false, isKidModeLock: Boolean = false, identifyMode: Boolean = false, lockedByParent: Boolean = false) {
+        // Stop the locked app leaking under the overlay: grab exclusive audio focus (pauses its video/music)
+        // and kill it in the background (stops playback + stales its recents thumbnail; the watchdog re-locks
+        // if the kid taps it again). Only kill genuine controlled apps — never the launcher/dialer/our own.
+        grabAudioFocus()
+        if (packageName != this.packageName &&
+            com.shantanu.shield.util.AllowedApps.isControlledPackage(this, packageName)
+        ) killLockedApp(packageName)
+
         // If overlay permission was revoked (e.g., user cleared app data, or first-run
         // before granting), fall back to the full-screen LockActivity path so we don't
         // crash with BadTokenException when adding TYPE_APPLICATION_OVERLAY.
@@ -786,7 +1068,7 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
         if (mustUseActivity) {
             launchLockActivity(packageName, eventTime, isKidModeLock, identifyMode)
         } else {
-            showOverlay(packageName, eventTime)
+            showOverlay(packageName, eventTime, lockedByParent, isKidModeLock, identifyMode)
         }
     }
 
@@ -811,13 +1093,13 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
         }
     }
 
-    private fun showOverlay(packageName: String, eventTime: Long = System.currentTimeMillis()) {
+    private fun showOverlay(packageName: String, eventTime: Long = System.currentTimeMillis(), lockedByParent: Boolean = false, isKidModeLock: Boolean = false, identifyMode: Boolean = false) {
         // Hard-stop if SYSTEM_ALERT_WINDOW was revoked at runtime. addView on type 2038
         // without the permission throws BadTokenException and crashes the service.
         // Fall back to the activity path so the user is still protected.
         if (!Settings.canDrawOverlays(this)) {
             Log.w("AppLock", "showOverlay: overlay permission missing, routing to LockActivity")
-            launchLockActivity(packageName, eventTime, isKidModeLock = false)
+            launchLockActivity(packageName, eventTime, isKidModeLock, identifyMode)
             return
         }
         // Skip only if an overlay is already up for this exact entry (same package and same event timestamp).
@@ -830,15 +1112,38 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
         // hideOverlay() re-scheduled a downgrade; cancel it again now that we're showing.
         mainHandler.removeCallbacks(downgradeFgsTask)
         isLockActive = true
+        kidModeLockShown = isKidModeLock && !lockedByParent
         lockingPackage = packageName
         lockingPackageEventTime = eventTime
 
-        updateForegroundService(useCamera = true)
+        // A parent-lock overlay uses no camera (no face auth), so don't put the service into CAMERA-FGS
+        // mode for it — that avoids the camera-type teardown race on hide that can SIG-9 the process.
+        updateForegroundService(useCamera = !lockedByParent)
 
         serviceScope.launch {
             val currentType = dataStoreManager.lockMessageType.first()
+            // Budget figures for the kid-mode lock screen. Read here, alongside the existing
+            // lockMessageType read and before the same post-suspend abort check below, so no new
+            // suspension window is opened.
+            val nowForLock = System.currentTimeMillis()
+            val (budgetUsedMs, budgetLimitMs) =
+                if (isKidModeLock && !lockedByParent) kidBudgetSnapshot(nowForLock)
+                else 0L to 0L
+            // Same condition shouldLockForKidMode uses for the night branch, so the message always
+            // names the real reason: at night the budget may be untouched, and telling the kid their
+            // limit is over would simply be false.
+            val isNightLock = isKidModeLock && !lockedByParent &&
+                nightLockUnlocked && isNightWindow(nowForLock)
             withContext(Dispatchers.Main) {
                 if (overlayView != null) hideOverlay()
+
+                // The read above suspends; a hide (auto-clear / app exit) may have run meanwhile and
+                // cleared the lock. Attaching now would orphan a full-screen window nobody will remove
+                // (isLockActive is false so no hide path fires). Abort if the lock is no longer wanted.
+                if (!isLockActive || lockingPackage != packageName || lockingPackageEventTime != eventTime) {
+                    Log.d("AppLock", "showOverlay aborted post-suspend: lock no longer active for $packageName.")
+                    return@withContext
+                }
 
                 val layoutType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                     WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
@@ -866,11 +1171,23 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
                         FaceLockOverlayContent(
                             packageName = packageName,
                             forcedMessageType = currentType,
+                            isKidModeLock = isKidModeLock,
+                            lockedByParent = lockedByParent,
+                            identifyMode = identifyMode,
+                            budgetUsedMs = budgetUsedMs,
+                            budgetLimitMs = budgetLimitMs,
+                            isNightLock = isNightLock,
+                            isFullLock = remoteLockFull,
+                            onParentUnlockCamera = { active -> onParentFaceScan(active) },
+                            onOpenPhone = { openCommsApp(sms = false) },
+                            onOpenMessages = { openCommsApp(sms = true) },
                             onAuthenticated = {
                                 Log.d("AppLock", "Authenticated for $packageName.")
                                 currentlyUnlockedPackage = packageName
                                 lastAuthTime = System.currentTimeMillis()
                                 isLockActive = false
+                                remoteLockActive = false   // a (parent) face auth clears the parent lock
+                                parentFaceScanActive = false
                                 armedPackage = null
                                 hideOverlay()
                             }
@@ -878,21 +1195,97 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
                     }
                 }
                 windowManager.addView(overlayView, params)
+                com.shantanu.shield.util.Diag.onOverlayAdded()
                 overlayLifecycleOwner?.onStart()
                 overlayLifecycleOwner?.onResume()
             }
         }
     }
 
+    // Default remote lock only: launch the default Phone / Messages app from the lock screen so the kid can
+    // still reach them (emergency safety). The monitor loop drops the overlay while they're foreground. The
+    // overlay holds SYSTEM_ALERT_WINDOW, so this background→activity launch is exempt from BAL restrictions.
+    private fun openCommsApp(sms: Boolean) {
+        try {
+            // Launch the EXACT resolved package where possible, so the foreground app matches the loop's
+            // dialerPackage/smsPackage exemption (which is what drops the overlay). Fall back to the standard
+            // action/category if the package or its launch intent can't be resolved.
+            val target = if (sms) smsPackage else dialerPackage
+            val intent = (target?.let { packageManager.getLaunchIntentForPackage(it) }
+                ?: if (sms) Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_APP_MESSAGING)
+                   else Intent(Intent.ACTION_DIAL))
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            startActivity(intent)
+        } catch (e: Exception) {
+            Log.e("AppLock", "openCommsApp(sms=$sms) failed", e)
+        }
+    }
+
+    // ---- Anti-leak: pause + kill the locked app so it can't run under the overlay / in recents ----
+    private val audioManager by lazy { getSystemService(AUDIO_SERVICE) as android.media.AudioManager }
+    private val audioFocusListener = android.media.AudioManager.OnAudioFocusChangeListener { }
+    private var audioFocusReq: android.media.AudioFocusRequest? = null
+    @Volatile private var audioFocusHeld = false
+
+    // Permanent GAIN (not transient) so a locked app's media stays paused — won't resume the instant we let go.
+    // Held for as long as the lock condition is active (see the monitor loop), so YouTube-Premium-style
+    // background/PiP playback after "minimize" can't keep going while the gate is up.
+    private fun grabAudioFocus() {
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                val req = android.media.AudioFocusRequest
+                    .Builder(android.media.AudioManager.AUDIOFOCUS_GAIN)
+                    .setOnAudioFocusChangeListener(audioFocusListener).build()
+                audioFocusReq = req
+                audioManager.requestAudioFocus(req)
+            } else {
+                @Suppress("DEPRECATION")
+                audioManager.requestAudioFocus(
+                    audioFocusListener, android.media.AudioManager.STREAM_MUSIC,
+                    android.media.AudioManager.AUDIOFOCUS_GAIN,
+                )
+            }
+            audioFocusHeld = true
+        } catch (_: Exception) {}
+    }
+
+    private fun releaseAudioFocus() {
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                audioFocusReq?.let { audioManager.abandonAudioFocusRequest(it) }
+                audioFocusReq = null
+            } else {
+                @Suppress("DEPRECATION") audioManager.abandonAudioFocus(audioFocusListener)
+            }
+        } catch (_: Exception) {}
+        audioFocusHeld = false
+    }
+
+    // Best-effort: kills the app's background process → stops playback + stales its recents thumbnail. No-op on
+    // a foreground process; OEMs may restrict it. Re-tried from the monitor loop when the app backgrounds.
+    private fun killLockedApp(pkg: String) {
+        if (pkg == packageName) return
+        try {
+            (getSystemService(ACTIVITY_SERVICE) as android.app.ActivityManager).killBackgroundProcesses(pkg)
+        } catch (_: Exception) {}
+    }
+
     private fun hideOverlay() {
-        if (overlayView != null) {
+        kidModeLockShown = false
+        val view = overlayView
+        if (view != null) {
             Log.d("AppLock", "Hiding overlay. Killing camera.")
+            // ALWAYS attempt removeView — never gate on isAttachedToWindow. During the async add that
+            // flag can be transiently false, and skipping removeView while nulling the reference below
+            // ORPHANS the window (attached at the WM level, reference lost) → a full-screen touchable
+            // overlay that eats every tap until reboot. removeView on a not-attached view just throws
+            // IllegalArgumentException, which we catch; removeViewImmediate is the fallback.
             try {
-                if (overlayView!!.isAttachedToWindow) {
-                    windowManager.removeView(overlayView)
-                }
+                windowManager.removeView(view)
+                com.shantanu.shield.util.Diag.onOverlayRemoved()
             } catch (e: Exception) {
-                Log.e("AppLock", "Failed to removeView", e)
+                try { windowManager.removeViewImmediate(view); com.shantanu.shield.util.Diag.onOverlayRemoved() }
+                catch (e2: Exception) { Log.e("AppLock", "Failed to removeView", e2) }
             }
             overlayView = null
             // FORCE CAMERA RELEASE: Set lifecycle to DESTROYED
@@ -956,6 +1349,7 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
     // Premium "Auto-lock new apps": lock a newly-installed user app and notify the parent.
     private suspend fun handleNewAppInstalled(pkg: String) {
         if (pkg == packageName) return
+        if (!newAppUnlocked) return                          // premium gate (B3)
         if (!dataStoreManager.autoBlockNewApps.first()) return
         // Only user-facing apps (the same predicate that defines "an app worth controlling").
         if (!com.shantanu.shield.util.AllowedApps.isControlledPackage(this, pkg)) return
@@ -1161,6 +1555,16 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // EVERY startForegroundService() must be answered by startForeground() within ~5s, or Android
+        // 12+ kills us with ForegroundServiceDidNotStartInTimeException. onCreate covers the first start,
+        // but a start while we're ALREADY running only hits onStartCommand (no onCreate) — which is the
+        // common "reopen the app after the Activity was destroyed but the service survived" case. So
+        // re-assert foreground here too. Idempotent when already foreground.
+        try {
+            startForeground(NOTIFICATION_ID, createNotification(), ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+        } catch (e: Exception) {
+            Log.e("AppLock", "startForeground failed in onStartCommand", e)
+        }
         if (intent?.action == ACTION_LOCK_RESULT) {
             handleLockResult(
                 intent.getStringExtra(EXTRA_PACKAGE_NAME),
@@ -1222,6 +1626,7 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
         screenTimePollJob?.cancel()
         hideOverlay()
         mainHandler.removeCallbacks(downgradeFgsTask)
+        commandListener?.remove()
         serviceLifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_DESTROY)
         serviceScope.cancel()
     }
