@@ -77,12 +77,25 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.asExecutor
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
+import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.util.concurrent.TimeUnit
 
 @AndroidEntryPoint
 class MainActivity : ComponentActivity() {
+
+    /** Runtime feature config. Re-fetched on resume so a tier change lands while someone is looking. */
+    @javax.inject.Inject lateinit var remoteConfigSource: com.shantanu.shield.premium.RemoteConfigSource
+
+    override fun onResume() {
+        super.onResume()
+        // The periodic refresh in AppLockApplication bounds staleness at six hours; this makes a
+        // Console flip visible as soon as the parent opens the app. Firebase's own minimum fetch
+        // interval makes a call inside the window a local no-op, so this is cheap to do every resume.
+        lifecycleScope.launch { runCatching { remoteConfigSource.refresh() } }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
@@ -1563,6 +1576,33 @@ private fun KidModeScreen(viewModel: MainViewModel, onBack: () -> Unit, onOpenMu
     }
     Column(modifier = Modifier.fillMaxSize()) {
         Column(modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 20.dp, vertical = 8.dp)) {
+            // The budget and the night lock are enforced only by flags in the foreground service. If
+            // either is converted to premium, the service stops acting while every control below still
+            // reads "on" — so say it here, at the top of the screen that claims to configure them.
+            val budgetUnlocked by viewModel.kidBudgetUnlocked.collectAsState(initial = true)
+            val nightUnlocked by viewModel.nightLockUnlocked.collectAsState(initial = true)
+            // Shown whether or not Kid Mode is currently on. Gating this on `isKidEnabled` was wrong:
+            // a parent setting Kid Mode up needs to know the limit won't be enforced BEFORE they switch
+            // it on and start relying on it — being told only afterwards is the same silent failure this
+            // banner exists to prevent. The wording adapts instead.
+            com.shantanu.shield.ui.LapseBanner(
+                locked = !budgetUnlocked,
+                title = if (isKidEnabled) "Daily limit is not being enforced"
+                        else "Daily limit needs Plus",
+                body = if (isKidEnabled) {
+                    "Kid Mode is on, but the daily screen-time limit needs Kids Shield Plus. Until it " +
+                        "is unlocked, your child's screen time is not being capped."
+                } else {
+                    "The daily screen-time limit needs Kids Shield Plus. Turning Kid Mode on will not " +
+                        "cap screen time until it is unlocked."
+                },
+            )
+            com.shantanu.shield.ui.LapseBanner(
+                locked = budgetUnlocked && !nightUnlocked,
+                title = if (isKidEnabled) "Night lock is not being enforced" else "Night lock needs Plus",
+                body = "The 10 PM – 7 AM lock needs Kids Shield Plus. Until it is unlocked, apps stay " +
+                    "usable overnight.",
+            )
             Card(
                 modifier = Modifier.fillMaxWidth(),
                 shape = RoundedCornerShape(20.dp),
@@ -1634,6 +1674,16 @@ fun TamperProtectionSection(viewModel: MainViewModel, forceExpanded: Boolean = f
     val activeCount = listOf(lockDeviceSettings, lockOwnApp && faceEnrolled, adminActive).count { it }
     val maxCount = 3
     val simpleAllOn = lockDeviceSettings && lockOwnApp && faceEnrolled
+
+    // Tamper protection's side-door challenge is a service flag. Locked, the switches below still read
+    // "on" while the protection they describe is not running.
+    val tamperOn by viewModel.tamperUnlocked.collectAsState(initial = true)
+    com.shantanu.shield.ui.LapseBanner(
+        locked = !tamperOn && activeCount > 0,
+        title = "Tamper protection is not active",
+        body = "These switches are on, but blocking the routes around Kids Shield needs Plus. Until " +
+            "it is unlocked, a child can reach them.",
+    )
 
     Text(
         "Stop a child from uninstalling the app or changing its settings.",
@@ -2215,7 +2265,17 @@ fun ProtectScreen(viewModel: MainViewModel) {
         nowMs = System.currentTimeMillis()
     }
 
+    // App lock is enforced by a single service flag. If it locks, protected apps simply stop being
+    // locked — the list below would still show them ticked. This is the only place that says otherwise.
+    val appLockOn by viewModel.appLockUnlocked.collectAsState(initial = true)
     Column(modifier = Modifier.fillMaxSize()) {
+        com.shantanu.shield.ui.LapseBanner(
+            locked = !appLockOn,
+            title = "Protected apps are not being locked",
+            body = "App lock needs Kids Shield Plus. The apps below are still listed, but they will " +
+                "open without a face scan until it is unlocked.",
+            modifier = Modifier.padding(horizontal = 20.dp),
+        )
         Box(modifier = Modifier.fillMaxWidth().coachTarget("status-banner")) {
             StatusBanner(viewModel)
         }

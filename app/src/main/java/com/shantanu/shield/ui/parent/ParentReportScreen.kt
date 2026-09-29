@@ -11,12 +11,16 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -65,11 +69,15 @@ import java.util.Locale
 @Composable
 fun ParentReportPane(
     onUnpair: () -> Unit,
+    onAddDevice: () -> Unit = {},
+    onRescanDevice: (com.shantanu.shield.remote.PairedDevice) -> Unit = {},
     viewModel: ParentReportViewModel = hiltViewModel(),
 ) {
     val state by viewModel.state.collectAsState()
     val controlUnlocked by viewModel.controlUnlocked.collectAsState()
     val commandStatus by viewModel.commandStatus.collectAsState()
+    val devices by viewModel.devices.collectAsState()
+    val activeDevice by viewModel.activeDevice.collectAsState()
 
     // Snackbar on every remote action (fires per send, repeats included).
     val snackbar = com.shantanu.shield.LocalSnackbarHostState.current
@@ -77,9 +85,58 @@ fun ParentReportPane(
         viewModel.commandEvent.collect { snackbar.showSnackbar(controlMessage(it)) }
     }
 
+    // Renaming matters as soon as there are two children: "Child device 2" tells a parent nothing about
+    // which phone they are about to lock.
+    var renaming by remember { mutableStateOf<com.shantanu.shield.remote.PairedDevice?>(null) }
+    renaming?.let { device ->
+        var draft by remember(device.pairingId) { mutableStateOf(device.label) }
+        AlertDialog(
+            onDismissRequest = { renaming = null },
+            title = { Text("Name this device") },
+            text = {
+                OutlinedTextField(
+                    value = draft,
+                    onValueChange = { draft = it.take(30) },
+                    singleLine = true,
+                    label = { Text("Whose phone is this?") },
+                    placeholder = { Text("e.g. Aarav's phone") },
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    enabled = draft.isNotBlank(),
+                    onClick = {
+                        viewModel.renameDevice(device.pairingId, draft)
+                        renaming = null
+                    },
+                ) { Text("Save") }
+            },
+            dismissButton = { TextButton(onClick = { renaming = null }) { Text("Cancel") } },
+        )
+    }
+
     Column(
         modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()),
     ) {
+        // Device switcher. Hidden at one device so the single-child experience is untouched.
+        if (devices.size > 1) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState())
+                    .padding(bottom = 12.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                devices.forEach { device ->
+                    FilterChip(
+                        selected = device.pairingId == activeDevice?.pairingId,
+                        onClick = { viewModel.selectDevice(device.pairingId) },
+                        label = { Text(device.label, maxLines = 1) },
+                    )
+                }
+            }
+        }
         when (val s = state) {
             is ParentReportViewModel.State.Loading ->
                 CenteredMessage { CircularProgressIndicator() }
@@ -95,13 +152,44 @@ fun ParentReportPane(
                     onRefresh = viewModel::refresh,
                 )
 
-            is ParentReportViewModel.State.Error ->
+            is ParentReportViewModel.State.Revoked -> {
+                // The definitive case: the child told us it rotated. Not an error, not empty — the link
+                // is simply dead, and the only fix is to scan the new code.
+                val stale = activeDevice
                 StatusBlock(
-                    title = "Couldn't read the report",
-                    body = "The data couldn't be decrypted with this device's key. If you re-paired, scan " +
-                        "the new code again.",
+                    title = "${stale?.label ?: "This device"} needs reconnecting",
+                    body = "This child's phone generated a new pairing code, so the old link no longer " +
+                        "works. Scan the new code shown on their phone to start seeing reports again.",
                     onRefresh = viewModel::refresh,
-                )
+                ) {
+                    if (stale != null) {
+                        Spacer(Modifier.height(12.dp))
+                        Button(onClick = { onRescanDevice(stale) }) {
+                            Text("Re-scan ${stale.label}'s code")
+                        }
+                    }
+                }
+            }
+
+            is ParentReportViewModel.State.Error -> {
+                // Name the child in the message. With several linked, "couldn't read the report" alone
+                // doesn't say WHOSE report broke — and the fix (re-scan that child's new code) needs the
+                // parent to know which phone to pick up (plan trap F).
+                val broken = activeDevice
+                StatusBlock(
+                    title = "Couldn't read ${broken?.label ?: "the report"}",
+                    body = "This data can't be unlocked with the code stored on this phone. That usually " +
+                        "means the child's device generated a new code — scan it again to reconnect.",
+                    onRefresh = viewModel::refresh,
+                ) {
+                    if (broken != null) {
+                        Spacer(Modifier.height(12.dp))
+                        Button(onClick = { onRescanDevice(broken) }) {
+                            Text("Re-scan ${broken.label}'s code")
+                        }
+                    }
+                }
+            }
 
             is ParentReportViewModel.State.NotPaired ->
                 StatusBlock(
@@ -116,9 +204,14 @@ fun ParentReportPane(
 
         // Grant/limit button feedback: tapped button turns YELLOW (sent, waiting) then GREEN once the next
         // synced report shows the child actually applied it. Child confirms automatically — no tap on its end.
-        var pendingLimit by remember { mutableStateOf<Int?>(null) }       // last limit minutes tapped
-        var pendingGrant by remember { mutableStateOf<Int?>(null) }       // last grant minutes tapped
-        var grantTarget by remember { mutableStateOf<Int?>(null) }        // target today's extension minutes
+        //
+        // Keyed on the active pairing id: this state is a claim about ONE child ("you just set 90 min on
+        // Aarav's phone"). Carrying it across a device switch would show a green "applied" tick against a
+        // sibling who was never sent anything (MULTI_DEVICE_PAIRING_PLAN.md trap B).
+        val activeId = activeDevice?.pairingId
+        var pendingLimit by remember(activeId) { mutableStateOf<Int?>(null) }   // last limit minutes tapped
+        var pendingGrant by remember(activeId) { mutableStateOf<Int?>(null) }   // last grant minutes tapped
+        var grantTarget by remember(activeId) { mutableStateOf<Int?>(null) }    // target today's extension minutes
         val limitConfirmed = pendingLimit != null && currentKid?.limitMin == pendingLimit
         val grantConfirmed = grantTarget != null && (currentKid?.extensionsMin ?: -1) >= grantTarget!!
 
@@ -147,10 +240,39 @@ fun ParentReportPane(
         )
 
         Spacer(Modifier.height(20.dp))
-        TextButton(onClick = onUnpair, modifier = Modifier.padding(start = 8.dp)) {
-            Icon(Icons.Filled.Refresh, contentDescription = null, modifier = Modifier.size(18.dp))
-            Spacer(Modifier.size(6.dp))
-            Text("Unpair")
+        activeDevice?.let { active ->
+            TextButton(onClick = { renaming = active }, modifier = Modifier.padding(start = 8.dp)) {
+                Icon(Icons.Filled.Edit, contentDescription = null, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.size(6.dp))
+                Text(if (devices.size > 1) "Rename ${active.label}" else "Name this device")
+            }
+        }
+        if (devices.size < com.shantanu.shield.remote.PairedDevices.MAX_DEVICES) {
+            TextButton(onClick = onAddDevice, modifier = Modifier.padding(start = 8.dp)) {
+                Icon(Icons.Filled.Add, contentDescription = null, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.size(6.dp))
+                Text("Link another child device")
+            }
+        }
+        // With one child, "Unpair" still means the whole feature — unchanged from before. With several,
+        // removing one must leave the others working, so it routes through unpairDevice rather than the
+        // global reset (plan trap A).
+        if (devices.size > 1) {
+            val active = activeDevice
+            TextButton(
+                onClick = { active?.let { viewModel.unpairDevice(it.pairingId) } },
+                modifier = Modifier.padding(start = 8.dp),
+            ) {
+                Icon(Icons.Filled.Refresh, contentDescription = null, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.size(6.dp))
+                Text("Remove ${active?.label ?: "this device"}")
+            }
+        } else {
+            TextButton(onClick = onUnpair, modifier = Modifier.padding(start = 8.dp)) {
+                Icon(Icons.Filled.Refresh, contentDescription = null, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.size(6.dp))
+                Text("Unpair")
+            }
         }
         Spacer(Modifier.height(20.dp))
     }
@@ -329,7 +451,12 @@ private fun TrendBars(weeks: List<Long>) {
 }
 
 @Composable
-private fun StatusBlock(title: String, body: String, onRefresh: () -> Unit) {
+private fun StatusBlock(
+    title: String,
+    body: String,
+    onRefresh: () -> Unit,
+    extra: @Composable () -> Unit = {},
+) {
     Column(
         modifier = Modifier.fillMaxWidth().padding(top = 32.dp, start = 8.dp, end = 8.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
@@ -348,6 +475,7 @@ private fun StatusBlock(title: String, body: String, onRefresh: () -> Unit) {
             Spacer(Modifier.size(6.dp))
             Text("Check again")
         }
+        extra()
     }
 }
 

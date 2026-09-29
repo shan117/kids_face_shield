@@ -336,6 +336,14 @@ object AllowedApps {
     // Compute the always-allowed set for the current preset choice. Our own package is
     // always included so the parent can never lock themselves out of the app that
     // manages the budget.
+    //
+    // The dialer and the SMS app are added for EVERY preset, Custom included. Reaching a parent must
+    // not depend on the parent having remembered to tick "Phone" while building a custom list: the
+    // failure only shows up when the budget runs out or night falls, which is exactly when a child is
+    // most likely to need to call home. (True 112/911 calls survive regardless — the platform
+    // emergency dialer is secure system UI drawn above app overlays — but calling Mum is not an
+    // emergency call.) A parent who genuinely wants the dialer restricted still has the parent-mode
+    // Protect picker, which is a separate, deliberate action.
     fun computeAlwaysAllowedSet(
         context: Context,
         preset: Int,
@@ -343,19 +351,12 @@ object AllowedApps {
     ): Set<String> {
         val out = LinkedHashSet<String>()
         out.add(context.packageName)
+        resolveDefaultPhonePackage(context)?.let { out.add(it) }
+        resolveDefaultSmsPackage(context)?.let { out.add(it) }
         when (preset) {
-            PRESET_PHONE_MESSAGES -> {
-                resolveDefaultPhonePackage(context)?.let { out.add(it) }
-                resolveDefaultSmsPackage(context)?.let { out.add(it) }
-            }
-            PRESET_PHONE_MESSAGES_WHATSAPP -> {
-                resolveDefaultPhonePackage(context)?.let { out.add(it) }
-                resolveDefaultSmsPackage(context)?.let { out.add(it) }
-                out.add(WHATSAPP_PACKAGE)
-            }
-            PRESET_CUSTOM -> {
-                out.addAll(customAllowed)
-            }
+            PRESET_PHONE_MESSAGES -> { /* dialer + SMS already added above */ }
+            PRESET_PHONE_MESSAGES_WHATSAPP -> out.add(WHATSAPP_PACKAGE)
+            PRESET_CUSTOM -> out.addAll(customAllowed)
         }
         return out
     }

@@ -47,12 +47,8 @@ private const val MANAGE_SUBS_URL =
     "https://play.google.com/store/account/subscriptions?sku=premium&package=com.appsecure.shield"
 
 // Premium value props shown on the screen (display copy; gating lives in the Feature flags).
-private val PLUS_FEATURES = listOf(
-    "Multiple kid profiles",
-    "Full screen-time history & trends",
-    "Unlimited app locks",
-    "Schedules & advanced controls"
-)
+// NOTE: the feature list is no longer hardcoded here. It is rendered from `config.premiumFeatures`
+// through FeatureCopy, so what the paywall sells is always exactly what is currently locked.
 
 /**
  * Early-access / paywall screen. Two modes driven by the runtime config:
@@ -174,10 +170,39 @@ private fun PaywallContent(
 
         // Body
         Column(modifier = Modifier.padding(22.dp)) {
-            PLUS_FEATURES.forEach { feature ->
+            // Exactly what is locked right now, straight from the runtime config.
+            val locked = com.shantanu.shield.premium.FeatureCopy.ordered(config.premiumFeatures)
+
+            Text(
+                if (config.promoActive) "Free for everyone right now" else "What Plus unlocks",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.ExtraBold,
+                color = cs.onSurface,
+            )
+            Spacer(Modifier.height(2.dp))
+            Text(
+                if (config.promoActive) {
+                    "Every feature below is included at no cost during early access."
+                } else {
+                    "${locked.size} feature${if (locked.size == 1) "" else "s"} — everything else stays free."
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = cs.onSurfaceVariant,
+            )
+            Spacer(Modifier.height(14.dp))
+
+            if (locked.isEmpty()) {
+                Text(
+                    "Everything in Kids Shield is currently free.",
+                    style = MaterialTheme.typography.bodyLarge,
+                    fontWeight = FontWeight.SemiBold,
+                    color = cs.onSurface,
+                )
+            }
+            locked.forEach { feature ->
                 Row(
-                    modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
-                    verticalAlignment = Alignment.CenterVertically
+                    modifier = Modifier.fillMaxWidth().padding(vertical = 7.dp),
+                    verticalAlignment = Alignment.Top
                 ) {
                     Surface(color = cs.secondaryContainer, shape = RoundedCornerShape(50), modifier = Modifier.size(28.dp)) {
                         Icon(
@@ -186,7 +211,18 @@ private fun PaywallContent(
                         )
                     }
                     Spacer(Modifier.width(12.dp))
-                    Text(feature, style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.SemiBold)
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            com.shantanu.shield.premium.FeatureCopy.title(feature),
+                            style = MaterialTheme.typography.bodyLarge,
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                        Text(
+                            com.shantanu.shield.premium.FeatureCopy.description(feature),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = cs.onSurfaceVariant,
+                        )
+                    }
                 }
             }
 

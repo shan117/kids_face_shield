@@ -1,6 +1,7 @@
 package com.shantanu.shield.data
 
 import android.content.Context
+import androidx.datastore.preferences.core.MutablePreferences
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.intPreferencesKey
@@ -9,6 +10,9 @@ import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.core.stringSetPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import com.shantanu.shield.face.FaceModelConfig
+import com.shantanu.shield.remote.PairedDevice
+import com.shantanu.shield.remote.PairedDeviceCodec
+import com.shantanu.shield.remote.PairedDevices
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.combine
@@ -107,6 +111,15 @@ class DataStoreManager @Inject constructor(@ApplicationContext private val conte
     private val REMOTE_SHARE_CADENCE_KEY = stringPreferencesKey("remote_share_cadence")
     // Remote Control (parent→child commands): child opt-in + the last command id applied (idempotency).
     private val REMOTE_CONTROL_ENABLED_KEY = booleanPreferencesKey("remote_control_enabled")
+
+    // ---- Multi-device pairing (PARENT role only) — see MULTI_DEVICE_PAIRING_PLAN.md ----
+    // The encoded List<PairedDevice> this parent phone is linked to. A CHILD device never reads these;
+    // it keeps using the single-valued REMOTE_PAIRING_* keys above, which is what keeps the enforcement
+    // path untouched by this feature.
+    private val PAIRED_DEVICES_KEY = stringPreferencesKey("remote_paired_devices")
+    // Which linked device the parent is currently viewing. May go stale (e.g. that device was removed),
+    // so it is only ever interpreted through PairedDevices.resolveActive.
+    private val ACTIVE_PAIRING_KEY = stringPreferencesKey("remote_active_pairing")
     private val LAST_APPLIED_COMMAND_ID_KEY = stringPreferencesKey("last_applied_command_id")
 
     val protectedApps: Flow<Set<String>> = context.dataStore.data.map { preferences ->
@@ -344,7 +357,9 @@ class DataStoreManager @Inject constructor(@ApplicationContext private val conte
         context.dataStore.edit { preferences -> preferences[REMOTE_SHARE_ENABLED_KEY] = enabled }
     }
 
-    /** Unpair / revoke: wipe the pairing secrets, role, share + control flags in one atomic edit. */
+    /** Unpair / revoke EVERYTHING: wipe the pairing secrets, role, share + control flags in one atomic
+     *  edit. To drop a single linked device on a multi-device parent use [removePairedDevice] instead —
+     *  this would take Remote Report down for the remaining children too (plan trap A). */
     suspend fun clearRemotePairing() {
         context.dataStore.edit { preferences ->
             preferences.remove(REMOTE_PAIRING_ID_KEY)
@@ -353,6 +368,95 @@ class DataStoreManager @Inject constructor(@ApplicationContext private val conte
             preferences.remove(REMOTE_SHARE_ENABLED_KEY)
             preferences.remove(REMOTE_CONTROL_ENABLED_KEY)
             preferences.remove(LAST_APPLIED_COMMAND_ID_KEY)
+            // Invariant 6 — a full reset must not leave the device list or the active pointer behind.
+            preferences.remove(PAIRED_DEVICES_KEY)
+            preferences.remove(ACTIVE_PAIRING_KEY)
+        }
+    }
+
+    // ---- Multi-device pairing (parent side) ----
+    //
+    // Every mutator below follows the same shape, and the shape is the safety property:
+    //   1. read + decode the current list inside the edit block
+    //   2. apply a PURE PairedDevices.* transform
+    //   3. write the list AND mirror element 0 into the legacy keys — in the SAME atomic edit
+    //
+    // Doing all three in one `edit {}` means the list and the legacy mirror can never disagree, even
+    // if the process dies mid-write (plan §4.1). The mirror is what lets the older read sites
+    // (RemoteCommandSender, ParentReportViewModel) keep working untouched, so the data layer can ship
+    // before any UI depends on it. It is removed in Phase 5.
+
+    val pairedDevices: Flow<List<PairedDevice>> = context.dataStore.data.map { preferences ->
+        PairedDeviceCodec.decode(preferences[PAIRED_DEVICES_KEY] ?: "")
+    }
+
+    /** The stored "currently viewing" id. Raw — resolve it with [PairedDevices.resolveActive]. */
+    val activePairingId: Flow<String> = context.dataStore.data.map { preferences ->
+        preferences[ACTIVE_PAIRING_KEY] ?: ""
+    }
+
+    /**
+     * Apply a device-list write to every key it affects, atomically.
+     *
+     * All the decisions — the legacy mirror (invariant 9) and keeping the active pointer inside the
+     * list (invariants 3 + 4) — live in the pure [PairedDevices.keyStateFor], which is unit-tested.
+     * This function only applies them, so there is no rule here that tests cannot reach.
+     */
+    private fun MutablePreferences.writeDevices(devices: List<PairedDevice>) {
+        val next = PairedDevices.keyStateFor(devices, this[ACTIVE_PAIRING_KEY] ?: "")
+        this[PAIRED_DEVICES_KEY] = PairedDeviceCodec.encode(next.devices)
+        next.legacyId?.let { this[REMOTE_PAIRING_ID_KEY] = it } ?: remove(REMOTE_PAIRING_ID_KEY)
+        next.legacyKey?.let { this[REMOTE_PAIRING_KEY_KEY] = it } ?: remove(REMOTE_PAIRING_KEY_KEY)
+        next.activeId?.let { this[ACTIVE_PAIRING_KEY] = it } ?: remove(ACTIVE_PAIRING_KEY)
+    }
+
+    /** Link a child device, or update the entry that already holds this pairing id. */
+    suspend fun addPairedDevice(device: PairedDevice) {
+        context.dataStore.edit { preferences ->
+            val current = PairedDeviceCodec.decode(preferences[PAIRED_DEVICES_KEY] ?: "")
+            preferences.writeDevices(PairedDevices.add(current, device))
+        }
+    }
+
+    /** Drop one linked device. Does NOT touch role / share / control flags — see [clearRemotePairing]. */
+    suspend fun removePairedDevice(pairingId: String) {
+        context.dataStore.edit { preferences ->
+            val current = PairedDeviceCodec.decode(preferences[PAIRED_DEVICES_KEY] ?: "")
+            preferences.writeDevices(PairedDevices.remove(current, pairingId))
+        }
+    }
+
+    suspend fun renamePairedDevice(pairingId: String, label: String) {
+        context.dataStore.edit { preferences ->
+            val current = PairedDeviceCodec.decode(preferences[PAIRED_DEVICES_KEY] ?: "")
+            preferences.writeDevices(PairedDevices.rename(current, pairingId, label))
+        }
+    }
+
+    /** Switch which linked device the parent is viewing. Ignored when the id isn't linked. */
+    suspend fun setActivePairingId(pairingId: String) {
+        context.dataStore.edit { preferences ->
+            val current = PairedDeviceCodec.decode(preferences[PAIRED_DEVICES_KEY] ?: "")
+            if (current.any { it.pairingId == pairingId }) preferences[ACTIVE_PAIRING_KEY] = pairingId
+        }
+    }
+
+    /**
+     * Fold a pre-multi-device parent's single pairing into the device list. Idempotent and safe to
+     * call on every startup (plan §4.3): a no-op once the list is non-empty, or when there are no
+     * legacy keys to fold. One atomic edit, so a mid-write kill leaves either the old or the new
+     * state, never a half-migrated one.
+     */
+    suspend fun migratePairedDevicesIfNeeded() {
+        context.dataStore.edit { preferences ->
+            if (preferences[REMOTE_ROLE_KEY] != "parent") return@edit
+            val current = PairedDeviceCodec.decode(preferences[PAIRED_DEVICES_KEY] ?: "")
+            val migrated = PairedDevices.migrate(
+                legacyId = preferences[REMOTE_PAIRING_ID_KEY] ?: "",
+                legacyKey = preferences[REMOTE_PAIRING_KEY_KEY] ?: "",
+                existing = current,
+            )
+            if (migrated !== current) preferences.writeDevices(migrated)
         }
     }
 

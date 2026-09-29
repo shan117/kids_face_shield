@@ -62,6 +62,10 @@ fun FaceLockOverlayContent(
     // True when the kid-mode lock is the 22:00–07:00 night lock rather than an exhausted budget.
     // Night lock is evaluated first in shouldLockForKidMode, so it wins the message too.
     isNightLock: Boolean = false,
+    // Whether this device actually has a dialer to offer. Gates the Phone/Messages buttons on the
+    // KID-MODE lock so a tablet with no telephony never shows a button that does nothing. (The parent
+    // remote lock has its own rule — it hides them on a FULL lock — so the two stay separate.)
+    kidCommsAccess: Boolean = false,
     // Remote parent-lock only: false = default lock (Phone & Messages stay reachable), true = full lock.
     isFullLock: Boolean = false,
     // Parent-lock only: called with true when the parent taps "Unlock with parent's face" (service enters
@@ -315,7 +319,10 @@ fun FaceLockOverlayContent(
                     KidModeLockView(
                         usedMs = budgetUsedMs,
                         limitMs = budgetLimitMs,
-                        isNightLock = isNightLock
+                        isNightLock = isNightLock,
+                        showCommsAccess = kidCommsAccess,
+                        onOpenPhone = onOpenPhone,
+                        onOpenMessages = onOpenMessages,
                     )
                 } else {
                     when (forcedMessageType) {
@@ -437,7 +444,14 @@ private fun formatLockDuration(ms: Long): String {
 }
 
 @Composable
-fun KidModeLockView(usedMs: Long = 0L, limitMs: Long = 0L, isNightLock: Boolean = false) {
+fun KidModeLockView(
+    usedMs: Long = 0L,
+    limitMs: Long = 0L,
+    isNightLock: Boolean = false,
+    showCommsAccess: Boolean = false,
+    onOpenPhone: () -> Unit = {},
+    onOpenMessages: () -> Unit = {},
+) {
     // Night lock is a different situation from an exhausted budget: nothing was overspent, and
     // waiting will not help until morning. Calm blue instead of alarm orange, and copy that says
     // when the phone works again.
@@ -519,6 +533,17 @@ fun KidModeLockView(usedMs: Long = 0L, limitMs: Long = 0L, isNightLock: Boolean 
             textAlign = TextAlign.Center,
             lineHeight = 26.sp
         )
+        // Phone and Messages are in the always-allowed set, so they were never actually blocked — but
+        // this overlay covers the home screen, so a child has no way to NAVIGATE to them and no reason
+        // to believe they are still reachable. Surfacing the buttons turns "you're locked out" into
+        // "you can still call someone", which is the whole point of the always-allowed set.
+        if (showCommsAccess) {
+            Spacer(Modifier.height(28.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                OutlinedButton(onClick = onOpenPhone) { Text("📞  Phone") }
+                OutlinedButton(onClick = onOpenMessages) { Text("💬  Messages") }
+            }
+        }
     }
 }
 

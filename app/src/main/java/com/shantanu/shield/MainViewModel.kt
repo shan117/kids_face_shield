@@ -64,6 +64,17 @@ class MainViewModel @Inject constructor(
     val multiKidUnlocked = entitlements.isUnlocked(Feature.MULTI_KID_PROFILES)
     // Default-free, but convertible to premium via config: gates the Custom allow-list picker (preset C).
     val allowedPresetsUnlocked = entitlements.isUnlocked(Feature.ALLOWED_PRESETS)
+
+    // ---- Lapse visibility for the ENFORCEMENT-only features ----
+    //
+    // APP_LOCK / KID_BUDGET / NIGHT_LOCK / TAMPER are enforced solely by flags inside the foreground
+    // service. If any is converted to premium (or a subscription lapses) the service simply stops
+    // acting on it — while every switch in Settings still reads "on". A parent would believe their
+    // child was protected when they were not. These flows exist so the UI can say so out loud.
+    val appLockUnlocked = entitlements.isUnlocked(Feature.APP_LOCK)
+    val kidBudgetUnlocked = entitlements.isUnlocked(Feature.KID_BUDGET)
+    val nightLockUnlocked = entitlements.isUnlocked(Feature.NIGHT_LOCK)
+    val tamperUnlocked = entitlements.isUnlocked(Feature.TAMPER)
     /** profileId -> (package -> daily-limit minutes), for Multiple-kids per-app caps. */
     val kidPerAppLimits = dataStoreManager.kidPerAppLimits
 

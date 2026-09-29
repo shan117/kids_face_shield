@@ -18,11 +18,22 @@ class RemoteCommandSender @Inject constructor(
 ) {
     enum class Result { SUCCESS, NOT_PARENT, NOT_PAIRED, FAILED }
 
-    suspend fun send(type: CommandType, arg: Int = 0, payload: String = ""): Result {
+    /**
+     * Send to a specific linked child device.
+     *
+     * The target is an explicit parameter rather than a DataStore read inside this function: with more
+     * than one child device linked, "the pairing" is no longer a property of the app — it is a property
+     * of what the parent is looking at. Making the caller name it removes any chance of a command
+     * reaching the wrong child (MULTI_DEVICE_PAIRING_PLAN.md §5, Phase 2).
+     */
+    suspend fun send(
+        type: CommandType,
+        arg: Int = 0,
+        payload: String = "",
+        target: PairedDevice?,
+    ): Result {
         if (dataStore.remoteRole.first() != "parent") return Result.NOT_PARENT
-        val pairingId = dataStore.remotePairingId.first()
-        val keyHex = dataStore.remotePairingKey.first()
-        if (pairingId.isBlank() || keyHex.isBlank()) return Result.NOT_PAIRED
+        if (target == null || target.pairingId.isBlank() || target.keyHex.isBlank()) return Result.NOT_PAIRED
 
         val command = RemoteCommand(
             commandId = UUID.randomUUID().toString(),
@@ -31,8 +42,7 @@ class RemoteCommandSender @Inject constructor(
             arg = arg,
             payload = payload,
         )
-        val keyBytes = PairingManager.Pairing(pairingId, keyHex).keyBytes()
-        val sealed = ReportCrypto.encrypt(RemoteCommandCodec.encode(command), keyBytes)
-        return if (repository.write(pairingId, sealed)) Result.SUCCESS else Result.FAILED
+        val sealed = ReportCrypto.encrypt(RemoteCommandCodec.encode(command), target.pairing().keyBytes())
+        return if (repository.write(target.pairingId, sealed)) Result.SUCCESS else Result.FAILED
     }
 }

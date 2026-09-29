@@ -93,10 +93,32 @@ fun ParentSetupScreen(
     val settingsLocked by viewModel.settingsLocked.collectAsState()
     val kidModeOn by viewModel.kidModeOn.collectAsState()
     var scanning by remember { mutableStateOf(false) }
+    // Non-null when this scan is re-linking an existing child (their device minted a new code) rather
+    // than adding a new one — so the old entry is retired instead of leaving a dead duplicate.
+    var replaceTarget by remember { mutableStateOf<com.shantanu.shield.remote.PairedDevice?>(null) }
     var showShareConsent by remember { mutableStateOf(false) }
 
     // A valid scan flips the role to "parent" via DataStore — leave the camera when that lands.
     LaunchedEffect(role) { if (role == "parent") scanning = false }
+
+    // Linking a SECOND child leaves the role already "parent", so the effect above never re-fires and the
+    // scanner would stay open. The scan outcome closes it instead, and reports what happened.
+    val scanResult by viewModel.scanResult.collectAsState()
+    val setupSnackbar = com.shantanu.shield.LocalSnackbarHostState.current
+    LaunchedEffect(scanResult) {
+        val outcome = scanResult ?: return@LaunchedEffect
+        scanning = false
+        replaceTarget = null
+        val message = when (outcome) {
+            is ParentSetupViewModel.ScanResult.Added -> "Linked ${outcome.label}"
+            is ParentSetupViewModel.ScanResult.Updated -> "Updated ${outcome.label}'s code"
+            is ParentSetupViewModel.ScanResult.AtCapacity ->
+                "You can link up to ${com.shantanu.shield.remote.PairedDevices.MAX_DEVICES} child devices. " +
+                    "Remove one first."
+        }
+        setupSnackbar.showSnackbar(message)
+        viewModel.consumeScanResult()
+    }
 
     // A2 — re-gate "weakening" actions (unpair / disable share·control / disable lockdown / rotate) behind a
     // fresh parent face when one is enrolled. Defense in depth: even with the app already open, a child
@@ -126,8 +148,10 @@ fun ParentSetupScreen(
             } else
             when {
                 scanning -> QrScanPane(
-                    onScanned = { text -> viewModel.onParentScanned(text) },
-                    onCancel = { scanning = false },
+                    onScanned = { text ->
+                        viewModel.onParentScanned(text, replacing = replaceTarget?.pairingId)
+                    },
+                    onCancel = { scanning = false; replaceTarget = null },
                 )
                 role == "child" -> Column(
                     modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()),
@@ -154,8 +178,18 @@ fun ParentSetupScreen(
                     onUnpair = { guard { viewModel.reset() } },
                   )
                 }
-                role == "parent" -> ParentReportPane(onUnpair = viewModel::reset)
-                else -> RoleChoicePane(kidModeOn = kidModeOn, onChild = viewModel::becomeChild, onParent = { scanning = true })
+                role == "parent" -> ParentReportPane(
+                    onUnpair = viewModel::reset,
+                    onAddDevice = { replaceTarget = null; viewModel.beginScan(); scanning = true },
+                    onRescanDevice = { device ->
+                        replaceTarget = device; viewModel.beginScan(); scanning = true
+                    },
+                )
+                else -> RoleChoicePane(
+                    kidModeOn = kidModeOn,
+                    onChild = viewModel::becomeChild,
+                    onParent = { viewModel.beginScan(); scanning = true },
+                )
             }
         }
     }

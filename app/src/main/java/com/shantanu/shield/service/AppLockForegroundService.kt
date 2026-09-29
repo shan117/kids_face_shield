@@ -1134,6 +1134,10 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
             // limit is over would simply be false.
             val isNightLock = isKidModeLock && !lockedByParent &&
                 nightLockUnlocked && isNightWindow(nowForLock)
+            // Offer Phone/Messages on the kid-mode lock only when this device actually has a dialer —
+            // on a Wi-Fi tablet the button would resolve to nothing.
+            val kidCommsAccess = isKidModeLock && !lockedByParent &&
+                com.shantanu.shield.util.AllowedApps.resolveDefaultPhonePackage(this@AppLockForegroundService) != null
             withContext(Dispatchers.Main) {
                 if (overlayView != null) hideOverlay()
 
@@ -1177,6 +1181,7 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
                             budgetUsedMs = budgetUsedMs,
                             budgetLimitMs = budgetLimitMs,
                             isNightLock = isNightLock,
+                            kidCommsAccess = kidCommsAccess,
                             isFullLock = remoteLockFull,
                             onParentUnlockCamera = { active -> onParentFaceScan(active) },
                             onOpenPhone = { openCommsApp(sms = false) },
