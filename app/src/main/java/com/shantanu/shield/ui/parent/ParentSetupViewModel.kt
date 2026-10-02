@@ -35,6 +35,9 @@ class ParentSetupViewModel @Inject constructor(
     private val entitlements: EntitlementRepository,
     private val reportRepository: RemoteReportRepository,
     private val commandRepository: RemoteCommandRepository,
+    private val locationRepository: com.shantanu.shield.remote.LocationRepository,
+    private val grantRepository: com.shantanu.shield.remote.GrantRepository,
+    private val pairingRepository: com.shantanu.shield.remote.PairingRepository,
 ) : ViewModel() {
 
     /** Sync cadence — "daily" or "weekly" (default). */
@@ -61,9 +64,19 @@ class ParentSetupViewModel @Inject constructor(
             if (oldId.isNotBlank()) {
                 reportRepository.revoke(oldId)
                 commandRepository.delete(oldId)
+                // Deleted, not revoked: a revocation marker is there to TELL the parent the link died,
+                // and the report already carries that message. Coordinates have no reason to linger
+                // once the key that authorised them is gone.
+                locationRepository.delete(oldId)
+                grantRepository.delete(oldId)
+                pairingRepository.delete(oldId)
             }
             val pairing = PairingManager.newPairing()
             dataStore.setRemotePairing(pairing.pairingIdHex, pairing.keyHex)
+            // A new pairing id needs its own membership record, with a fresh claim window — the parent
+            // has to re-scan after a rotation, and without this there would be nothing for them to
+            // claim, so the new pairing would be unusable under the strict rules.
+            pairingRepository.ensureMembership(pairing.pairingIdHex)
         }
     }
 
@@ -100,6 +113,21 @@ class ParentSetupViewModel @Inject constructor(
                 PairingManager.encodeQr(PairingManager.Pairing(id, key))
             } else null
         }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null)
+
+    /**
+     * Child: whether this device answers location requests. Separate from report sharing and from
+     * remote control on purpose — one consent must not silently cover a far more sensitive one.
+     *
+     * Settable only here, on the child device. There is deliberately no command that lets a parent turn
+     * this on remotely: that is the line between a family feature and a covert tracker.
+     */
+    val locationSharingEnabled: StateFlow<Boolean> =
+        dataStore.locationSharingEnabled
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), false)
+
+    fun setLocationSharing(enabled: Boolean) {
+        viewModelScope.launch { dataStore.setLocationSharingEnabled(enabled) }
+    }
 
     /** Opt-in switch: while false, nothing is uploaded (the privacy invariant). */
     val shareEnabled: StateFlow<Boolean> =
@@ -188,6 +216,23 @@ class ParentSetupViewModel @Inject constructor(
                 dataStore.setRemotePairing(pairing.pairingIdHex, pairing.keyHex)
             }
             dataStore.setRemoteRole("child")
+            // Record this device as the pairing's first member so the parent has something to claim.
+            ensurePairingMembership()
+        }
+    }
+
+    /**
+     * Child: create or refresh the pairing's membership record.
+     *
+     * Called when a pairing is minted and again whenever the QR is on screen, so the claim window is
+     * open exactly while someone is actually pairing. A child can mint a pairing, put the phone down,
+     * and be scanned an hour later — a window fixed at creation would have closed by then and left the
+     * pairing permanently unclaimable. Idempotent; stops extending once two devices are recorded.
+     */
+    fun ensurePairingMembership() {
+        viewModelScope.launch {
+            val pairingId = dataStore.remotePairingId.first()
+            if (pairingId.isNotBlank()) pairingRepository.ensureMembership(pairingId)
         }
     }
 
@@ -250,8 +295,14 @@ class ParentSetupViewModel @Inject constructor(
             val replacedLabel = if (replacing != null && replacing != pairing.pairingIdHex) {
                 val old = dataStore.pairedDevices.first().firstOrNull { it.pairingId == replacing }
                 if (old != null) {
+                    // All five collections, not just these two. Location logs and grants outliving the
+                    // pairing that authorised them is exactly the leak the other teardown paths were
+                    // fixed for; this path was written before those collections existed.
                     reportRepository.delete(replacing)
                     commandRepository.delete(replacing)
+                    locationRepository.delete(replacing)
+                    grantRepository.delete(replacing)
+                    pairingRepository.delete(replacing)
                     dataStore.removePairedDevice(replacing)
                 }
                 old?.label
@@ -274,6 +325,11 @@ class ParentSetupViewModel @Inject constructor(
                     addedAtMs = System.currentTimeMillis(),
                 )
             )
+            // Claim membership of the pairing, so the strict rules recognise this device on the child's
+            // documents (reports, locations) as well as its own. Done here because this is the one
+            // moment both devices are demonstrably present — the child is holding up its QR.
+            pairingRepository.claim(pairing.pairingIdHex)
+
             // Show the newly-linked child straight away.
             dataStore.setActivePairingId(pairing.pairingIdHex)
             dataStore.setRemoteRole("parent")
@@ -307,6 +363,9 @@ class ParentSetupViewModel @Inject constructor(
             for (id in ids) {
                 reportRepository.delete(id)
                 commandRepository.delete(id)
+                locationRepository.delete(id)
+                grantRepository.delete(id)
+                pairingRepository.delete(id)
             }
             dataStore.clearRemotePairing()
         }

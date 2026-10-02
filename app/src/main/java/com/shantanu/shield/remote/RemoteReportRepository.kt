@@ -47,7 +47,7 @@ class RemoteReportRepository @Inject constructor() {
     /** Upload the encrypted report. Returns false on any failure (offline, rules, init) — never throws. */
     suspend fun write(pairingId: String, sealed: Sealed): Boolean = runCatching {
         suspendCancellableCoroutine { cont ->
-            val data = hashMapOf(
+            val data = hashMapOf<String, Any>(
                 "iv" to Blob.fromBytes(sealed.iv),
                 "ciphertext" to Blob.fromBytes(sealed.ciphertext),
                 "updatedAt" to System.currentTimeMillis(),

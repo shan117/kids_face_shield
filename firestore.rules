@@ -24,5 +24,36 @@ service cloud.firestore {
       allow get, create, update, delete: if true;
       allow list: if false;
     }
+
+    // Child location log. Same bearer-token model again: one document per pairing holding the whole
+    // capped log (a subcollection is impossible here — `list` is denied everywhere, by design).
+    //
+    // The relay stores coordinates it cannot read: the document is an AES-GCM iv + ciphertext pair
+    // under the pairing key, which only the two paired devices hold. Knowing the id lets you fetch the
+    // blob and nothing more. Delete is allowed so unpair / key-rotation / "clear history" can wipe the
+    // cloud copy — location must never outlive the pairing that authorised it.
+    // See LOCATION_FEATURE_PLAN.md §3.
+    match /locations/{pairingId} {
+      allow get, create, update, delete: if true;
+      allow list: if false;
+    }
+
+    // Entitlement grants. The parent writes "this child is covered until <date>"; the child reads it.
+    // Same bearer-token model, and encrypted under the pairing key for AUTHENTICITY rather than secrecy:
+    // an expiry timestamp is not a secret, but a plaintext grant would let anyone who learned a pairing
+    // id hand themselves free premium. See ENTITLEMENT_SHARING_PLAN.md.
+    match /grants/{pairingId} {
+      allow get, create, update, delete: if true;
+      allow list: if false;
+    }
+
+    // Pairing membership: which two device uids a pairing belongs to. Written at pairing time and read
+    // by the strict rules in firestore.rules.phase7, where it becomes the thing that stops the pairing
+    // id working as a bearer token. Permissive here like everything else until that switchover.
+    // See PHASE7_AUTH_PLAN.md.
+    match /pairings/{pairingId} {
+      allow get, create, update, delete: if true;
+      allow list: if false;
+    }
   }
 }

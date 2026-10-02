@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Non-adaptive fallback for API 24-25, which predate adaptive-icon. minSdk is 24, so without this the
+  launcher has nothing to resolve on those versions.
+
+  Same design as the adaptive pair — teal globe on brand cream — but with its own rounded ground,
+  since there is no adaptive background layer to mask here.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <path
+        android:pathData="M12,30 Q12,12 30,12 L78,12 Q96,12 96,30 L96,78 Q96,96 78,96 L30,96 Q12,96 12,78 Z"
+        android:fillColor="#FFF7EC" />
+
+    <path
+        android:pathData="M32,54 a22,22 0 1,0 44,0 a22,22 0 1,0 -44,0"
+        android:strokeColor="#006072"
+        android:strokeWidth="5"
+        android:strokeLineCap="round" />
+    <path
+        android:pathData="M32,54 L76,54"
+        android:strokeColor="#006072"
+        android:strokeWidth="5"
+        android:strokeLineCap="round" />
+    <path
+        android:pathData="M54,32 a12,22 0 1,0 0,44 a12,22 0 1,0 0,-44"
+        android:strokeColor="#006072"
+        android:strokeWidth="5"
+        android:strokeLineCap="round" />
+</vector>

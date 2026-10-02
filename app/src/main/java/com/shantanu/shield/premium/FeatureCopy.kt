@@ -31,6 +31,9 @@ object FeatureCopy {
         Feature.THEMES -> "Themes"
         Feature.REMOTE_REPORT -> "Remote report"
         Feature.REMOTE_CONTROL -> "Remote control"
+        Feature.LOCATION_NOW -> "Find their phone"
+        Feature.LOCATION_HISTORY -> "Location history"
+        Feature.WEB_FILTER -> "Safe browsing"
     }
 
     fun description(feature: Feature): String = when (feature) {
@@ -51,6 +54,9 @@ object FeatureCopy {
         Feature.THEMES -> "Accent colours and lock-screen styles"
         Feature.REMOTE_REPORT -> "See their screen time on your own phone"
         Feature.REMOTE_CONTROL -> "Lock, unlock and grant time from anywhere"
+        Feature.LOCATION_NOW -> "Ask where their phone is, right now"
+        Feature.LOCATION_HISTORY -> "Every place you've looked them up before"
+        Feature.WEB_FILTER -> "Block adult sites, with a browser you control"
     }
 
     /**

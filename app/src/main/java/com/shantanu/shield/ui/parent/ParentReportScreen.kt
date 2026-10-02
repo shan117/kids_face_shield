@@ -239,6 +239,29 @@ fun ParentReportPane(
             onSetPerAppLimit = viewModel::setChildPerAppLimit,
         )
 
+        // Location. Placed after the report so the screen-time answer — the reason the parent opened
+        // this — still comes first.
+        val locationState by viewModel.locationState.collectAsState()
+        val locationUnlocked by viewModel.locationUnlocked.collectAsState()
+        val historyUnlocked by viewModel.locationHistoryUnlocked.collectAsState()
+        activeDevice?.let { active ->
+            Spacer(Modifier.height(20.dp))
+            com.shantanu.shield.ui.PremiumGate(
+                unlocked = locationUnlocked,
+                featureName = "Find their phone",
+                description = "Ask where their phone is, right now.",
+            ) {
+                LocationSection(
+                    state = locationState,
+                    childLabel = active.label,
+                    historyUnlocked = historyUnlocked,
+                    resolver = viewModel.addressResolver,
+                    onRequest = viewModel::requestLocation,
+                    onClearHistory = viewModel::clearLocationHistory,
+                )
+            }
+        }
+
         Spacer(Modifier.height(20.dp))
         activeDevice?.let { active ->
             TextButton(onClick = { renaming = active }, modifier = Modifier.padding(start = 8.dp)) {

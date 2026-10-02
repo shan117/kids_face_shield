@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Foreground for the Kids Shield Browser launcher icon: a globe in the brand teal.
+
+  A globe rather than a variant of the shield mark, because the two icons sit side by side in the app
+  drawer and must be tellable apart at 48dp. Teal on cream is the inverse of the app icon's warm mark
+  on teal — same family, opposite weight.
+
+  Drawn inside the 72x72dp adaptive safe zone of the 108x108 viewport. Strokes are heavy (5dp) because
+  thin strokes disappear once the launcher scales the icon down.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- Globe outline -->
+    <path
+        android:pathData="M31,54 a23,23 0 1,0 46,0 a23,23 0 1,0 -46,0"
+        android:strokeColor="#006072"
+        android:strokeWidth="5"
+        android:strokeLineCap="round" />
+
+    <!-- Equator -->
+    <path
+        android:pathData="M31,54 L77,54"
+        android:strokeColor="#006072"
+        android:strokeWidth="5"
+        android:strokeLineCap="round" />
+
+    <!-- Meridian -->
+    <path
+        android:pathData="M54,31 a12.5,23 0 1,0 0,46 a12.5,23 0 1,0 0,-46"
+        android:strokeColor="#006072"
+        android:strokeWidth="5"
+        android:strokeLineCap="round" />
+</vector>

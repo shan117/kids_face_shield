@@ -51,10 +51,15 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
     @Inject lateinit var remoteCommandRepository: RemoteCommandRepository
     @Inject lateinit var remoteCommandApplier: RemoteCommandApplier
     @Inject lateinit var remoteReportSync: RemoteReportSync
+    @Inject lateinit var locationProvider: com.shantanu.shield.location.LocationProvider
+    @Inject lateinit var locationResponder: com.shantanu.shield.location.LocationResponder
+    @Inject lateinit var privateDnsMonitor: com.shantanu.shield.webfilter.PrivateDnsMonitor
+    @Inject lateinit var grantRepository: com.shantanu.shield.remote.GrantRepository
 
     // Live Firestore listener for parent→child commands (Remote Control); null unless this is a paired,
     // control-enabled child. Re-attached on state change; removed in onDestroy.
     private var commandListener: com.google.firebase.firestore.ListenerRegistration? = null
+    private var grantListener: com.google.firebase.firestore.ListenerRegistration? = null
     private val serviceScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
     
     private lateinit var windowManager: WindowManager
@@ -119,6 +124,11 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
     @Volatile private var tamperUnlocked: Boolean = true
     // APP_LOCK: the core parent-mode per-app face lock. Gating it = the whole app can be made paid.
     @Volatile private var appLockUnlocked: Boolean = true
+    @Volatile private var webFilterUnlocked: Boolean = true
+    // Defaults FALSE, unlike the entitlement flags above: blocking every browser on the phone is a
+    // large, surprising change, so it happens only once the parent has explicitly asked for it — never
+    // during the moment before the first DataStore emission lands.
+    @Volatile private var webFilterEnabledNow: Boolean = false
 
     // Gated by the FREE_PLAY entitlement: when locked (premium, non-subscriber), Free Play no longer
     // bypasses locks — i.e. the feature is off. Default true = free.
@@ -175,6 +185,8 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
             // The device-truth utility checks (launcher icon / clock + home role) are cached per
             // package; the set of installed packages just changed, so drop the cache.
             com.shantanu.shield.util.AllowedApps.clearPackageCaches()
+            // A newly installed browser must be blocked too, so the resolved browser set can't go stale.
+            com.shantanu.shield.webfilter.BrowserApps.clearCache()
             if (action == Intent.ACTION_PACKAGE_ADDED) serviceScope.launch { handleNewAppInstalled(pkg) }
             // The child's installed-app list changed → re-upload so the parent's picker stays current. Debounced
             // so a burst (restore / bulk update) collapses to one upload. syncNow() is gated (child + share-on).
@@ -235,6 +247,13 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
         const val NOTIFICATION_ID = 101
         const val CHANNEL_ID = "AppLockServiceChannel"
         const val FREE_PLAY_NOTIFICATION_ID = 102
+        /** Child-visible "your location was shared" notice. */
+        const val LOCATION_NOTIFICATION_ID = 103
+        /** "Web filtering turned off" notice. */
+        const val WEB_FILTER_NOTIFICATION_ID = 104
+        /** Once a day. One tiny document per linked child — cheap, and bounds how long a cancelled
+         *  family keeps premium to the lease window rather than to this interval. */
+        const val GRANT_RENEWAL_INTERVAL_MS = 24L * 60 * 60 * 1000
         const val FREE_PLAY_CHANNEL_ID = "FreePlayChannel"
         const val ACTION_CHECK_PACKAGE = "ACTION_CHECK_PACKAGE"
         const val EXTRA_PACKAGE_NAME = "EXTRA_PACKAGE_NAME"
@@ -286,6 +305,67 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
         serviceScope.launch { entitlementRepository.isUnlocked(Feature.FREE_PLAY).collect { freePlayUnlocked = it } }
         serviceScope.launch { entitlementRepository.isUnlocked(Feature.TAMPER).collect { tamperUnlocked = it } }
         serviceScope.launch { entitlementRepository.isUnlocked(Feature.APP_LOCK).collect { appLockUnlocked = it } }
+        serviceScope.launch { entitlementRepository.isUnlocked(Feature.WEB_FILTER).collect { webFilterUnlocked = it } }
+
+        // ---- Shared entitlement (ENTITLEMENT_SHARING_PLAN.md) ----
+        //
+        // PARENT side: one payment has to cover the family, but every premium feature runs on the
+        // CHILD's phone, which made no purchase. So while this device owns a subscription, it re-issues
+        // a short grant to each linked child once a day. Renewal rather than a fixed end date because
+        // the subscription's expiry does not exist on the device — only "am I premium right now" does.
+        //
+        // Revocation needs no delivery: stop being premium, stop renewing, and the grant decays.
+        serviceScope.launch {
+            while (true) {
+                runCatching { renewPremiumGrants() }
+                delay(GRANT_RENEWAL_INTERVAL_MS)
+            }
+        }
+
+        // CHILD side: adopt grants the paired parent publishes. Attaches only in the child role — a
+        // parent device must never be able to grant itself premium.
+        serviceScope.launch {
+            combine(
+                dataStoreManager.remoteRole,
+                dataStoreManager.remotePairingId,
+                dataStoreManager.remotePairingKey,
+            ) { role, pairingId, keyHex -> Triple(role, pairingId, keyHex) }
+                .collect { (role, pairingId, keyHex) ->
+                    grantListener?.remove()
+                    grantListener = null
+                    if (role != "child" || pairingId.isBlank() || keyHex.isBlank()) return@collect
+                    val keyBytes = com.shantanu.shield.remote.PairingManager
+                        .Pairing(pairingId, keyHex).keyBytes()
+                    grantListener = grantRepository.listen(pairingId) { sealed ->
+                        serviceScope.launch { onPremiumGrant(sealed, keyBytes) }
+                    }
+                }
+        }
+        // Cached rather than read inside shouldLockForKidMode: that function runs on the 250 ms lock
+        // path and a suspending DataStore read there would cost a frame on every app switch.
+        serviceScope.launch { dataStoreManager.webFilterEnabled.collect { webFilterEnabledNow = it } }
+
+        // Web filtering (Phase 0) can only be verified, never enforced — Private DNS is not writable by
+        // a normal app. So the one guarantee worth offering is that it cannot be switched off QUIETLY:
+        // watch for filtering→not-filtering and say so. Only on a kid-owned device, and only after it
+        // has been seen working, so this can never fire at a parent who simply hasn't set it up.
+        serviceScope.launch {
+            var everFiltered = false
+            combine(
+                dataStoreManager.ownerType,
+                privateDnsMonitor.state,
+            ) { owner, dns -> owner to dns }
+                .collect { (owner, dns) ->
+                    if (owner != "kid") return@collect
+                    if (dns.isFiltering) {
+                        everFiltered = true
+                    } else if (everFiltered) {
+                        everFiltered = false      // one notice per lapse, not one per network blip
+                        Log.w("AppLock", "web filtering stopped: Private DNS no longer filtering")
+                        postWebFilterOffNotification()
+                    }
+                }
+        }
 
         // Remote Control: while the child has it enabled AND is paired, listen for parent→child commands
         // and apply them (grant time / set limit via DataStore here; LOCK_NOW via the lock path below).
@@ -295,11 +375,18 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
                 dataStoreManager.remoteRole,
                 dataStoreManager.remotePairingId,
                 dataStoreManager.remoteControlEnabled,
-            ) { role, pairingId, enabled -> Triple(role, pairingId, enabled) }
-                .collect { (role, pairingId, enabled) ->
+                dataStoreManager.locationSharingEnabled,
+            ) { role, pairingId, controlEnabled, locationEnabled ->
+                // EITHER consent opens the channel; what may actually be acted on is decided per
+                // command by CommandConsent. A child who consented to location sharing alone must be
+                // able to receive a location request — and, just as importantly, a child who consented
+                // to location alone must still be immune to LOCK_NOW.
+                Triple(role, pairingId, controlEnabled || locationEnabled)
+            }
+                .collect { (role, pairingId, shouldListen) ->
                     commandListener?.remove()
                     commandListener = null
-                    if (role == "child" && pairingId.isNotBlank() && enabled) {
+                    if (role == "child" && pairingId.isNotBlank() && shouldListen) {
                         commandListener = remoteCommandRepository.listen(pairingId) { sealed ->
                             serviceScope.launch { onRemoteCommand(sealed) }
                         }
@@ -674,6 +761,13 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
                     this, active.allowedPreset, active.customAllowed
                 )
                 if (pkg in perKidAllowed) return false
+                // Same browser containment as the single-kid path below. Repeated rather than hoisted
+                // because each branch has its own always-allowed set, and that bypass must keep
+                // running first: without this the whole feature is silently inert once Multiple-kids
+                // is active, which is worse than it not existing.
+                if (webFilterUnlocked && webFilterEnabledNow &&
+                    com.shantanu.shield.webfilter.BrowserApps.isOtherBrowser(this, pkg)
+                ) return true
                 return com.shantanu.shield.kid.MultiKidEnforcement.shouldLock(
                     usedMs = active.usedMs,
                     dailyLimitMinutes = active.dailyLimitMinutes,
@@ -699,6 +793,15 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
         val allowed = com.shantanu.shield.util.AllowedApps.computeAlwaysAllowedSet(this, dataStoreManager)
         if (pkg in allowed) return false
 
+        // Web filtering: with it on, every OTHER browser is blocked so the child is funnelled into the
+        // filtered in-app browser. Positioned AFTER the always-allowed bypass on purpose — emergency
+        // comms must never be collateral damage — and gated on the entitlement plus the parent's own
+        // switch, so it is impossible to enable this by accident. BrowserApps excludes our own package,
+        // so the app can never lock itself out of the browser it provides.
+        if (webFilterUnlocked && webFilterEnabledNow &&
+            com.shantanu.shield.webfilter.BrowserApps.isOtherBrowser(this, pkg)
+        ) return true
+
         // Hard lock during the configured night window — gated by the NIGHT_LOCK entitlement.
         if (nightLockUnlocked && isNightWindow(nowMs)) return true
 
@@ -720,6 +823,76 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
      *
      * Returns (0, 0) when no budget applies (no identified kid) — the overlay then renders as before.
      */
+    /**
+     * Answer a parent's location request.
+     *
+     * Raises the foreground service to include the `location` type for the duration of the fix and
+     * lowers it again in a `finally`, so a failure can never leave the service permanently claiming
+     * location. That temporary elevation is the whole reason this app does not need
+     * ACCESS_BACKGROUND_LOCATION. See LOCATION_FEATURE_PLAN.md §5.
+     */
+    private suspend fun handleLocationRequest(requestedAtMs: Long) {
+        try {
+            // Preserve whatever the camera state already is. A face-unlock overlay may be scanning
+            // right now, and dropping CAMERA here would kill its camera mid-scan.
+            updateForegroundService(useCamera = fgsCameraActive, useLocation = true)
+            val fix = locationResponder.respond(
+                requestedAtMs = requestedAtMs,
+                onFixShared = { postLocationSharedNotification() },
+            )
+            Log.d("AppLock", "location request answered: ${fix?.status}")
+        } catch (e: Exception) {
+            Log.e("AppLock", "location request failed", e)
+        } finally {
+            // Drop only the location type; re-read the camera flag because an overlay may have come or
+            // gone while the fix was in flight.
+            updateForegroundService(useCamera = fgsCameraActive, useLocation = false)
+        }
+    }
+
+    /**
+     * Parent: publish a fresh grant to every linked child, if this device is premium.
+     *
+     * Silent no-op unless this is a paired parent that actually owns a subscription — so a child device
+     * or a free parent never writes anything.
+     */
+    private suspend fun renewPremiumGrants() {
+        if (dataStoreManager.remoteRole.first() != "parent") return
+        if (!entitlementRepository.isPremium.first()) return
+
+        val devices = dataStoreManager.pairedDevices.first()
+        if (devices.isEmpty()) return
+
+        val grant = com.shantanu.shield.remote.PremiumGrants.renew(System.currentTimeMillis())
+        val plaintext = com.shantanu.shield.remote.PremiumGrantCodec.encode(grant)
+        for (device in devices) {
+            val sealed = com.shantanu.shield.remote.ReportCrypto
+                .encrypt(plaintext, device.pairing().keyBytes())
+            val ok = grantRepository.write(device.pairingId, sealed)
+            if (!ok) Log.w("AppLock", "premium grant upload failed for ${device.label}")
+        }
+        Log.i("AppLock", "premium grants renewed for ${devices.size} device(s)")
+    }
+
+    /**
+     * Child: adopt a grant from the paired parent.
+     *
+     * The grant must decrypt under the pairing key. That is the authenticity check — knowing a pairing
+     * id is not enough to hand yourself free premium, because a forged document will not decrypt.
+     */
+    private suspend fun onPremiumGrant(sealed: com.shantanu.shield.remote.Sealed?, keyBytes: ByteArray) {
+        if (sealed == null) return
+        val plaintext = com.shantanu.shield.remote.ReportCrypto.decrypt(sealed, keyBytes)
+        if (plaintext == null) {
+            // Almost always a leftover document from a rotated key, not an attack. Either way: ignore.
+            Log.w("AppLock", "premium grant won't decrypt with this device's key — ignored")
+            return
+        }
+        val grant = com.shantanu.shield.remote.PremiumGrantCodec.decode(plaintext) ?: return
+        dataStoreManager.setPremiumGrantUntil(grant.premiumUntilMs)
+        Log.i("AppLock", "premium grant adopted, valid until ${grant.premiumUntilMs}")
+    }
+
     private suspend fun kidBudgetSnapshot(nowMs: Long): Pair<Long, Long> {
         if (isMultiKidActive()) {
             val activeId = com.shantanu.shield.kid.MultiKidEnforcement.activeProfileId(
@@ -1028,11 +1201,13 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
                 isLockActive = false
                 hideOverlay()
             }
+            CommandType.REQUEST_LOCATION -> handleLocationRequest(applied.issuedAtMs)
             // Budget/config commands are applied to DataStore in the applier. Re-upload the report so the
             // parent's live listener reflects the change at once, instead of waiting for the periodic sync.
             CommandType.GRANT_EXTRA_TIME, CommandType.SET_DAILY_LIMIT,
             CommandType.SET_ALLOWED_PRESET, CommandType.SET_AUTO_BLOCK,
-            CommandType.SET_CUSTOM_ALLOWED, CommandType.SET_PER_APP_LIMIT ->
+            CommandType.SET_CUSTOM_ALLOWED, CommandType.SET_PER_APP_LIMIT,
+            CommandType.SET_WEB_CATEGORIES ->
                 serviceScope.launch { remoteReportSync.syncNow() }
         }
     }
@@ -1308,12 +1483,28 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
         }
     }
 
-    private fun updateForegroundService(useCamera: Boolean) {
+    /**
+     * Whether the service is currently claiming the CAMERA foreground type.
+     *
+     * Tracked because location and camera share this one call: a location request that arrives while a
+     * face-unlock overlay is scanning must not silently drop CAMERA and kill the running camera.
+     * Anything that toggles the location type reads this to preserve the camera state.
+     */
+    @Volatile private var fgsCameraActive: Boolean = false
+
+    private fun updateForegroundService(useCamera: Boolean, useLocation: Boolean = false) {
+        fgsCameraActive = useCamera
         val notification = createNotification()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             var type = ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
             if (useCamera && ContextCompat.checkSelfPermission(this, android.Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
                 type = type or ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA
+            }
+            // `location` is added only while a fix is in flight, and only when the runtime permission is
+            // actually held — a type whose permission is missing makes startForeground throw. This is
+            // what lets the app read location without ACCESS_BACKGROUND_LOCATION at all.
+            if (useLocation && locationProvider.hasPermission()) {
+                type = type or ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
             }
             try {
                 startForeground(NOTIFICATION_ID, notification, type)
@@ -1392,6 +1583,62 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
             getSystemService(NotificationManager::class.java).notify(pkg.hashCode(), notification)
         } catch (e: SecurityException) {
             Log.w("AppLock", "POST_NOTIFICATIONS not granted; skipping new-app notification")
+        }
+    }
+
+    /**
+     * Tell the child their location was just shared.
+     *
+     * Not optional, and not configurable away by the parent. Android's status-bar indicator shows that
+     * location was *used*, never by whom or to whom it went. A monitoring feature the monitored person
+     * cannot see is a tracker; this notification is what keeps this a family feature.
+     * See LOCATION_FEATURE_PLAN.md §10.
+     */
+    private fun postLocationSharedNotification() {
+        val openIntent = PendingIntent.getActivity(
+            this, 0,
+            Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        val notification = NotificationCompat.Builder(this, FREE_PLAY_CHANNEL_ID)
+            .setSmallIcon(android.R.drawable.ic_menu_mylocation)
+            .setContentTitle("Location shared")
+            .setContentText("Your parent asked where this phone is, and it was sent to them.")
+            .setContentIntent(openIntent)
+            .setAutoCancel(true)
+            .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+            .build()
+        try {
+            getSystemService(NotificationManager::class.java)
+                .notify(LOCATION_NOTIFICATION_ID, notification)
+        } catch (e: SecurityException) {
+            Log.w("AppLock", "POST_NOTIFICATIONS not granted; skipping location-shared notification")
+        }
+    }
+
+    /**
+     * Web filtering stopped. Fires only after it was previously seen working on a kid-owned device, so
+     * it reports a change rather than nagging about a feature the parent never enabled.
+     */
+    private fun postWebFilterOffNotification() {
+        val openIntent = PendingIntent.getActivity(
+            this, 0,
+            Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        val notification = NotificationCompat.Builder(this, FREE_PLAY_CHANNEL_ID)
+            .setSmallIcon(android.R.drawable.ic_dialog_alert)
+            .setContentTitle("Web filtering turned off")
+            .setContentText("This phone can now reach any website. Tap to set it up again.")
+            .setContentIntent(openIntent)
+            .setAutoCancel(true)
+            .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+            .build()
+        try {
+            getSystemService(NotificationManager::class.java)
+                .notify(WEB_FILTER_NOTIFICATION_ID, notification)
+        } catch (e: SecurityException) {
+            Log.w("AppLock", "POST_NOTIFICATIONS not granted; skipping web-filter notification")
         }
     }
 
@@ -1632,6 +1879,7 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
         hideOverlay()
         mainHandler.removeCallbacks(downgradeFgsTask)
         commandListener?.remove()
+        grantListener?.remove()
         serviceLifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_DESTROY)
         serviceScope.cancel()
     }

@@ -61,6 +61,9 @@ class RemoteReportGatherer @Inject constructor(
                     customAllowed = dataStoreManager.customAlwaysAllowed.first().toList(),
                     perAppLimits = dataStoreManager.perAppLimits.first().map { AppStat(it.key, it.value.toLong()) },
                     extensionsMin = (dataStoreManager.extensionsTodayMs.first() / 60_000L).toInt(),
+                    // Counts per category only — never which sites. See KidReport.webBlocks.
+                    webBlocks = dataStoreManager.webBlockCounts.first()
+                        .map { (category, count) -> AppStat(category.name, count.toLong()) },
                 )
             )
         }

@@ -34,6 +34,8 @@ object RemoteReportBuilder {
         customAllowed: List<String> = emptyList(),
         perAppLimits: List<AppStat> = emptyList(),
         extensionsMin: Int = -1,
+        /** Web-filter refusals as per-category COUNTS. Never domains — see [KidReport.webBlocks]. */
+        webBlocks: List<AppStat> = emptyList(),
     ): KidReport =
         KidReport(
             name = name,
@@ -53,5 +55,6 @@ object RemoteReportBuilder {
             customAllowed = customAllowed,
             perAppLimits = perAppLimits,
             extensionsMin = extensionsMin,
+            webBlocks = webBlocks,
         )
 }

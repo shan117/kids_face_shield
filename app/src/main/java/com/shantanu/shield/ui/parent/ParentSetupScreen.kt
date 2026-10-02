@@ -85,6 +85,7 @@ fun ParentSetupScreen(
     val syncStatus by viewModel.syncStatus.collectAsState()
     val unlocked by viewModel.remoteReportUnlocked.collectAsState()
     val controlEnabled by viewModel.remoteControlEnabled.collectAsState()
+    val locationSharingEnabled by viewModel.locationSharingEnabled.collectAsState()
     val controlUnlocked by viewModel.remoteControlUnlocked.collectAsState()
     val shareCadence by viewModel.shareCadence.collectAsState()
     val lockedDown by viewModel.deviceLockedDown.collectAsState()
@@ -153,7 +154,12 @@ fun ParentSetupScreen(
                     },
                     onCancel = { scanning = false; replaceTarget = null },
                 )
-                role == "child" -> Column(
+                role == "child" -> {
+                  // Refresh the pairing's claim window while the QR is actually visible. A child can
+                  // mint a pairing, put the phone down, and be scanned much later — a window fixed at
+                  // creation would have closed and left the pairing unclaimable.
+                  LaunchedEffect(childQr) { if (childQr != null) viewModel.ensurePairingMembership() }
+                  Column(
                     modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()),
                     horizontalAlignment = Alignment.CenterHorizontally,
                 ) {
@@ -162,6 +168,7 @@ fun ParentSetupScreen(
                     shareEnabled = shareEnabled,
                     unlocked = unlocked,
                     controlEnabled = controlEnabled,
+                    locationSharingEnabled = locationSharingEnabled,
                     controlUnlocked = controlUnlocked,
                     cadence = shareCadence,
                     lockedDown = lockedDown,
@@ -171,12 +178,16 @@ fun ParentSetupScreen(
                     syncStatus = syncStatus,
                     onToggleShare = { on -> if (on) showShareConsent = true else guard { viewModel.setSharing(false) } },
                     onToggleControl = { on -> if (on) viewModel.setRemoteControl(true) else guard { viewModel.setRemoteControl(false) } },
+                    // Turning location sharing OFF is not a "weakening" action needing the parent face:
+                    // the child must always be able to withdraw this particular consent themselves.
+                    onToggleLocation = viewModel::setLocationSharing,
                     onSetCadence = viewModel::setCadence,
                     onSetLockdown = { on -> if (on) viewModel.setDeviceLockdown(true) else guard { viewModel.setDeviceLockdown(false) } },
                     onSyncNow = viewModel::syncNow,
                     onRotateKey = { guard { viewModel.rotateKey() } },
                     onUnpair = { guard { viewModel.reset() } },
                   )
+                  }
                 }
                 role == "parent" -> ParentReportPane(
                     onUnpair = viewModel::reset,
@@ -438,6 +449,7 @@ private fun ChildQrPane(
     shareEnabled: Boolean,
     unlocked: Boolean,
     controlEnabled: Boolean,
+    locationSharingEnabled: Boolean,
     controlUnlocked: Boolean,
     cadence: String,
     lockedDown: Boolean,
@@ -447,6 +459,7 @@ private fun ChildQrPane(
     syncStatus: RemoteReportSync.Result?,
     onToggleShare: (Boolean) -> Unit,
     onToggleControl: (Boolean) -> Unit,
+    onToggleLocation: (Boolean) -> Unit,
     onSetCadence: (String) -> Unit,
     onSetLockdown: (Boolean) -> Unit,
     onSyncNow: () -> Unit,
@@ -587,6 +600,54 @@ private fun ChildQrPane(
                 )
             }
             Switch(checked = controlEnabled, onCheckedChange = onToggleControl, enabled = controlUnlocked)
+        }
+    }
+
+    Spacer(Modifier.height(10.dp))
+    // Location is a SEPARATE consent from screen-time sharing and from remote control. Bundling it
+    // into either would mean one "yes" silently covering something far more sensitive.
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(18.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer),
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(16.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(Modifier.weight(1f)) {
+                Text("Share location when asked", style = MaterialTheme.typography.titleSmall)
+                Text(
+                    if (locationSharingEnabled) {
+                        "On — this phone answers when your parent asks where it is. You'll get a " +
+                            "notification each time. This works on its own; it doesn't switch on " +
+                            "remote control."
+                    } else {
+                        "Off — your parent is told the request was declined."
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            // Switching ON must also secure the runtime permission, or the child would see "On" while
+            // every request came back PERMISSION_DENIED — a setting that lies about itself.
+            val locationPermLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
+                androidx.activity.result.contract.ActivityResultContracts.RequestMultiplePermissions()
+            ) { granted ->
+                onToggleLocation(granted.values.any { it })
+            }
+            Switch(
+                checked = locationSharingEnabled,
+                onCheckedChange = { on ->
+                    if (!on) onToggleLocation(false)
+                    else locationPermLauncher.launch(
+                        arrayOf(
+                            android.Manifest.permission.ACCESS_FINE_LOCATION,
+                            android.Manifest.permission.ACCESS_COARSE_LOCATION,
+                        )
+                    )
+                },
+            )
         }
     }
 

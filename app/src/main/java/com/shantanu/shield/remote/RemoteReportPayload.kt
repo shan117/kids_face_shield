@@ -35,6 +35,15 @@ data class KidReport(
     val perAppLimits: List<AppStat> = emptyList(),
     // Today's granted extra minutes — lets the parent confirm a GRANT_EXTRA_TIME actually applied. -1 = old doc.
     val extensionsMin: Int = -1,
+    /**
+     * Web-filter refusals, as COUNTS per category (AppStat.name = category name, AppStat.ms = count).
+     *
+     * Counts, deliberately never the domains. The payload's whole premise is that it carries patterns
+     * and not content, and a list of the sites a child tried to reach is content — it would turn this
+     * from a safety report into a browsing log. A parent needs to know whether it is happening far
+     * more than they need the addresses. Empty on old docs. See WEB_FILTER_PLAN.md Phase 2.
+     */
+    val webBlocks: List<AppStat> = emptyList(),
 )
 
 data class AppStat(val name: String, val ms: Long)
@@ -81,6 +90,7 @@ object RemoteReportCodec {
                 strings(k.customAllowed),
                 apps(k.perAppLimits),
                 k.extensionsMin.toString(),
+                apps(k.webBlocks),
             ).joinToString(US.toString())
         }
         return p.generatedAtMs.toString() + US + kidsBlock
@@ -135,6 +145,7 @@ object RemoteReportCodec {
             customAllowed = f.getOrNull(14)?.let(::parseStrings) ?: emptyList(),
             perAppLimits = f.getOrNull(15)?.let(::parseApps) ?: emptyList(),
             extensionsMin = f.getOrNull(16)?.toIntOrNull() ?: -1,
+            webBlocks = f.getOrNull(17)?.let(::parseApps) ?: emptyList(),
         )
     }.getOrNull()
 }

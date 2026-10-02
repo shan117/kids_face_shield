@@ -8,6 +8,18 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE"
         tools:node="replace" />
+    <!-- Read the active network's Private DNS state for the web-filtering setup check. Normal
+         permission, no runtime prompt. Declared explicitly rather than relying on Firebase's manifest
+         merge, so the check can't silently break if a dependency changes. -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+    <!-- Child location, requested by the parent on demand. Deliberately WITHOUT
+         ACCESS_BACKGROUND_LOCATION: the already-running foreground service adds the `location` type
+         only while a fix is in flight, which permits while-in-use access. See
+         LOCATION_FEATURE_PLAN.md §5. -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.KILL_BACKGROUND_PROCESSES" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
@@ -46,9 +58,47 @@
             android:showWhenLocked="true"
             android:turnScreenOn="true" />
 
+        <!-- The filtered browser. Registering the http/https intent filter is what makes link-opening
+             keep working once other browsers are blocked: taps in WhatsApp, games and so on route here
+             instead of dead-ending, and the child can even set this as the default browser.
+
+             taskAffinity is NOT optional. Without it this activity inherits the package's default
+             affinity — the same task as MainActivity — and `singleTask` then makes the browser that
+             task's ROOT. Once the browser had been opened, tapping EITHER launcher icon just resumed
+             that task and showed the browser. Its own affinity gives it its own task and its own
+             Recents entry, like a separate app, which is what two launcher icons imply.
+
+             singleTop rather than singleTask: still collapses repeat launches onto one instance, but
+             without the task-root hijacking. Repeat launches arrive at onNewIntent, which the activity
+             handles. -->
+        <activity
+            android:name="com.shantanu.shield.webfilter.ShieldBrowserActivity"
+            android:label="Kids Shield Browser"
+            android:icon="@mipmap/ic_browser"
+            android:roundIcon="@mipmap/ic_browser"
+            android:exported="true"
+            android:configChanges="orientation|screenSize|keyboardHidden"
+            android:launchMode="singleTop"
+            android:taskAffinity=":browser">
+            <!-- Its own home-screen icon. Without this the browser is only reachable by tapping a
+                 link in another app — so a child who simply wants to browse has nowhere to go, which
+                 is the one thing a browser must not be. -->
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="http" />
+                <data android:scheme="https" />
+            </intent-filter>
+        </activity>
+
         <service
             android:name="com.shantanu.shield.service.AppLockForegroundService"
-            android:foregroundServiceType="camera|specialUse"
+            android:foregroundServiceType="camera|location|specialUse"
             android:exported="false">
             <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="App locking and security service" />

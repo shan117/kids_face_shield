@@ -1056,7 +1056,7 @@ private fun StatusBanner(viewModel: MainViewModel) {
     }
 }
 
-private enum class SettingsRoute { Hub, KidMode, MultiKid, ScreenTimeApps, RemoteReport, Paywall, Tamper, Appearance, Permissions, Help }
+private enum class SettingsRoute { Hub, KidMode, MultiKid, ScreenTimeApps, WebFilter, RemoteReport, Paywall, Tamper, Appearance, Permissions, Help }
 
 @Composable
 fun SettingsScreen(
@@ -1090,6 +1090,13 @@ fun SettingsScreen(
             // the child cannot. On a parent-owned phone it's a pass-through.
             ParentGate {
                 com.shantanu.shield.ui.stats.ScreenTimeAppsSection()
+            }
+        }
+        SettingsRoute.WebFilter -> SettingsDetailScreen("Web filtering", onBack = back) {
+            // Parent-gated on a kid-owned device: changing what the child can reach online is a
+            // parent decision, same as the screen-time exclusions.
+            ParentGate {
+                com.shantanu.shield.webfilter.WebFilterSection()
             }
         }
         SettingsRoute.RemoteReport -> com.shantanu.shield.ui.parent.ParentSetupScreen(onBack = back)
@@ -1254,6 +1261,13 @@ private fun SettingsHub(
                 onClick = { onNavigate(SettingsRoute.Permissions) }
             )
         }
+        Spacer(Modifier.height(12.dp))
+        SettingsHubRow(
+            icon = Icons.Default.Search,
+            title = "Web filtering",
+            subtitle = "Block adult sites across every app on this phone",
+            onClick = { onNavigate(SettingsRoute.WebFilter) }
+        )
         Spacer(Modifier.height(12.dp))
         SettingsHubRow(
             icon = Icons.Default.DateRange,

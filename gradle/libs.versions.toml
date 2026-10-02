@@ -75,6 +75,9 @@ zxing-core = { group = "com.google.zxing", name = "core", version.ref = "zxing" 
 
 # Firebase Firestore — encrypted remote-report relay (ciphertext only). BoM-managed version.
 firebase-firestore = { group = "com.google.firebase", name = "firebase-firestore" }
+# Firebase Auth — anonymous sign-in only, so the relay rules can tell one paired device from another.
+# No login, no email, no password is ever shown to a user. See PHASE7_AUTH_PLAN.md.
+firebase-auth = { group = "com.google.firebase", name = "firebase-auth" }
 
 # WorkManager — weekly background sync of the child's encrypted report.
 androidx-work-runtime = { group = "androidx.work", name = "work-runtime-ktx", version.ref = "work" }

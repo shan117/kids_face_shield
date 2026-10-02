@@ -138,6 +138,11 @@ dependencies {
 
     // Firebase Firestore — E2E-encrypted remote report relay (stores ciphertext only)
     implementation(libs.firebase.firestore)
+    // Firebase Auth — ANONYMOUS sign-in only. Gives each install a stable uid so the Firestore rules
+    // can restrict a pairing's documents to the two devices that actually paired, instead of to anyone
+    // who learns the pairing id. No account, login or password is ever surfaced to a user.
+    // See PHASE7_AUTH_PLAN.md.
+    implementation(libs.firebase.auth)
     // Real Guava on the COMPILE classpath: Firestore exposes Guava only as runtime `implementation`, so
     // with the empty `listenablefuture` stub excluded (above) CameraX's ListenableFuture would otherwise
     // be unresolved. The -android variant is the right one for an Android app.

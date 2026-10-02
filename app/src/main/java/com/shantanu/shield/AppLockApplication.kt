@@ -31,6 +31,9 @@ class AppLockApplication : Application() {
     // Runtime feature config (promo / per-feature tiers). Re-fetched periodically below.
     @Inject lateinit var remoteConfigSource: com.shantanu.shield.premium.RemoteConfigSource
 
+    // Anonymous device identity, warmed at startup so relay writes don't pay for sign-in.
+    @Inject lateinit var deviceIdentity: com.shantanu.shield.remote.DeviceIdentity
+
     private val appScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     override fun onCreate() {
@@ -45,6 +48,11 @@ class AppLockApplication : Application() {
         appScope.launch {
             dataStoreManager.statsExcludedPackages.collect { AllowedApps.setParentExcluded(it) }
         }
+
+        // Establish the anonymous identity early, so the first relay write isn't stalled behind a
+        // network round trip. Fire-and-forget: a failure here is not an error — DeviceIdentity returns
+        // null, no membership is recorded, and every local protection carries on regardless.
+        appScope.launch { runCatching { deviceIdentity.uid() } }
 
         // Fold a pre-multi-device parent's single pairing into the device list. THE single call site —
         // idempotent, so running it on every start is harmless, and atomic, so being killed mid-write

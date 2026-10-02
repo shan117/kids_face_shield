@@ -13,6 +13,9 @@ import com.shantanu.shield.face.FaceModelConfig
 import com.shantanu.shield.remote.PairedDevice
 import com.shantanu.shield.remote.PairedDeviceCodec
 import com.shantanu.shield.remote.PairedDevices
+import com.shantanu.shield.webfilter.DomainBlocklist
+import com.shantanu.shield.webfilter.WebBlockCountCodec
+import com.shantanu.shield.webfilter.WebFilterCategory
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.combine
@@ -120,6 +123,31 @@ class DataStoreManager @Inject constructor(@ApplicationContext private val conte
     // Which linked device the parent is currently viewing. May go stale (e.g. that device was removed),
     // so it is only ever interpreted through PairedDevices.resolveActive.
     private val ACTIVE_PAIRING_KEY = stringPreferencesKey("remote_active_pairing")
+
+    // ---- Location sharing (CHILD device) — see LOCATION_FEATURE_PLAN.md §5 ----
+    // Defaults OFF and is set on the child, never remotely: a parent who could switch this on from
+    // their own phone would make this a covert tracker rather than a family feature.
+    private val LOCATION_SHARING_KEY = booleanPreferencesKey("location_sharing_enabled")
+
+    // ---- Shared entitlement (CHILD device) — see ENTITLEMENT_SHARING_PLAN.md ----
+    // When the paired parent's premium covers this device, until when. The child made no purchase, so
+    // its own isPremium is false; this is how one payment reaches the devices the features run on.
+    // Read on every entitlement check rather than cached as a boolean, so an expiry cannot be
+    // "remembered" as still valid.
+    private val PREMIUM_GRANT_UNTIL_KEY = longPreferencesKey("premium_grant_until_ms")
+
+    // ---- Web filtering (in-app browser) — see WEB_FILTER_PLAN.md ----
+    // Master switch. Off by default: turning it on blocks every other browser on the phone, which is
+    // far too big a change to make on a parent's behalf without them asking.
+    private val WEB_FILTER_ENABLED_KEY = booleanPreferencesKey("web_filter_enabled")
+    private val WEB_FILTER_CATEGORIES_KEY = stringSetPreferencesKey("web_filter_categories")
+    // Parent overrides. Allow beats block beats category — see DomainBlocklist.decide.
+    private val WEB_ALLOWED_DOMAINS_KEY = stringSetPreferencesKey("web_allowed_domains")
+    private val WEB_BLOCKED_DOMAINS_KEY = stringSetPreferencesKey("web_blocked_domains")
+    // Aggregate counters only: how many navigations each category refused. Deliberately NOT the
+    // domains — a list of sites a child tried to reach is the kind of content this app promises never
+    // to ship off-device, so only counts can reach the parent's weekly report.
+    private val WEB_BLOCK_COUNTS_KEY = stringPreferencesKey("web_block_counts")
     private val LAST_APPLIED_COMMAND_ID_KEY = stringPreferencesKey("last_applied_command_id")
 
     val protectedApps: Flow<Set<String>> = context.dataStore.data.map { preferences ->
@@ -385,6 +413,111 @@ class DataStoreManager @Inject constructor(@ApplicationContext private val conte
     // if the process dies mid-write (plan §4.1). The mirror is what lets the older read sites
     // (RemoteCommandSender, ParentReportViewModel) keep working untouched, so the data layer can ship
     // before any UI depends on it. It is removed in Phase 5.
+
+    // ---- Shared entitlement ----
+
+    /** Until when the paired parent's premium covers this device. 0 = never granted. */
+    val premiumGrantUntilMs: Flow<Long> = context.dataStore.data.map { preferences ->
+        preferences[PREMIUM_GRANT_UNTIL_KEY] ?: 0L
+    }
+
+    /**
+     * Record a grant. Monotonic: a later expiry never replaces an earlier one with a shorter window.
+     *
+     * Guards against a stale document re-delivered by the Firestore listener — on reconnect it replays
+     * the last value it saw, which could otherwise claw back a grant the device had already extended.
+     */
+    suspend fun setPremiumGrantUntil(untilMs: Long) {
+        context.dataStore.edit { preferences ->
+            val current = preferences[PREMIUM_GRANT_UNTIL_KEY] ?: 0L
+            if (untilMs > current) preferences[PREMIUM_GRANT_UNTIL_KEY] = untilMs
+        }
+    }
+
+    /** Drop the grant — on unpair, or when the device stops being a child. */
+    suspend fun clearPremiumGrant() {
+        context.dataStore.edit { preferences -> preferences.remove(PREMIUM_GRANT_UNTIL_KEY) }
+    }
+
+    // ---- Web filtering ----
+
+    val webFilterEnabled: Flow<Boolean> = context.dataStore.data.map { preferences ->
+        preferences[WEB_FILTER_ENABLED_KEY] ?: false
+    }
+
+    suspend fun setWebFilterEnabled(enabled: Boolean) {
+        context.dataStore.edit { preferences -> preferences[WEB_FILTER_ENABLED_KEY] = enabled }
+    }
+
+    /** Enabled categories. Unset means the shipped defaults, not "none". */
+    val webFilterCategories: Flow<Set<WebFilterCategory>> = context.dataStore.data.map { preferences ->
+        val stored = preferences[WEB_FILTER_CATEGORIES_KEY]
+            ?: return@map WebFilterCategory.DEFAULT_ON
+        stored.mapNotNull { WebFilterCategory.fromName(it) }.toSet()
+    }
+
+    suspend fun setWebFilterCategories(categories: Set<WebFilterCategory>) {
+        context.dataStore.edit { preferences ->
+            // Stored even when empty, so "the parent turned everything off" is distinguishable from
+            // "the parent has never chosen" — the latter must fall back to the defaults.
+            preferences[WEB_FILTER_CATEGORIES_KEY] = categories.map { it.name }.toSet()
+        }
+    }
+
+    val webAllowedDomains: Flow<Set<String>> = context.dataStore.data.map { preferences ->
+        preferences[WEB_ALLOWED_DOMAINS_KEY] ?: emptySet()
+    }
+
+    val webBlockedDomains: Flow<Set<String>> = context.dataStore.data.map { preferences ->
+        preferences[WEB_BLOCKED_DOMAINS_KEY] ?: emptySet()
+    }
+
+    /** Add or remove a parent override. [domain] is normalised; a blank one is ignored. */
+    suspend fun setWebDomainOverride(domain: String, allow: Boolean?, remove: Boolean = false) {
+        val normalized = DomainBlocklist.normalizeHost(domain) ?: return
+        context.dataStore.edit { preferences ->
+            val allowed = (preferences[WEB_ALLOWED_DOMAINS_KEY] ?: emptySet()).toMutableSet()
+            val blocked = (preferences[WEB_BLOCKED_DOMAINS_KEY] ?: emptySet()).toMutableSet()
+            // A domain is never in both lists: the two are mutually exclusive states of one decision,
+            // and leaving a stale entry in the other list makes the precedence rule look broken.
+            allowed.remove(normalized)
+            blocked.remove(normalized)
+            if (!remove) when (allow) {
+                true -> allowed.add(normalized)
+                false -> blocked.add(normalized)
+                null -> {}
+            }
+            preferences[WEB_ALLOWED_DOMAINS_KEY] = allowed
+            preferences[WEB_BLOCKED_DOMAINS_KEY] = blocked
+        }
+    }
+
+    /** Per-category counts of refused navigations. Counts only — never the domains. */
+    val webBlockCounts: Flow<Map<WebFilterCategory, Int>> = context.dataStore.data.map { preferences ->
+        WebBlockCountCodec.decode(preferences[WEB_BLOCK_COUNTS_KEY] ?: "")
+    }
+
+    suspend fun recordWebBlock(category: WebFilterCategory?) {
+        context.dataStore.edit { preferences ->
+            val current = WebBlockCountCodec.decode(preferences[WEB_BLOCK_COUNTS_KEY] ?: "")
+            val key = category ?: return@edit      // parent-list blocks aren't category stats
+            val next = current + (key to (current[key] ?: 0) + 1)
+            preferences[WEB_BLOCK_COUNTS_KEY] = WebBlockCountCodec.encode(next)
+        }
+    }
+
+    suspend fun clearWebBlockCounts() {
+        context.dataStore.edit { preferences -> preferences.remove(WEB_BLOCK_COUNTS_KEY) }
+    }
+
+    /** Child: whether this device answers location requests at all. Off until the child opts in. */
+    val locationSharingEnabled: Flow<Boolean> = context.dataStore.data.map { preferences ->
+        preferences[LOCATION_SHARING_KEY] ?: false
+    }
+
+    suspend fun setLocationSharingEnabled(enabled: Boolean) {
+        context.dataStore.edit { preferences -> preferences[LOCATION_SHARING_KEY] = enabled }
+    }
 
     val pairedDevices: Flow<List<PairedDevice>> = context.dataStore.data.map { preferences ->
         PairedDeviceCodec.decode(preferences[PAIRED_DEVICES_KEY] ?: "")

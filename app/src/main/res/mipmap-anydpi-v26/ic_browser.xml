@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Adaptive launcher icon for the browser (API 26+). The inverse of the app icon — teal globe on the
+     brand cream — so the two are the same family but separable at icon size. -->
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+    <background android:drawable="@drawable/ic_browser_background" />
+    <foreground android:drawable="@drawable/ic_browser_foreground" />
+    <monochrome android:drawable="@drawable/ic_browser_foreground" />
+</adaptive-icon>
