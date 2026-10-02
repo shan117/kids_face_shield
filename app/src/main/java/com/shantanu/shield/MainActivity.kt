@@ -518,8 +518,35 @@ private fun ChildDashboard(onParentSettings: () -> Unit) {
         }
 
         Spacer(Modifier.height(24.dp))
-        Button(onClick = { showAsk = true }, modifier = Modifier.fillMaxWidth()) {
-            Text("Ask for more time")
+        // The ask now actually asks. The previous version opened a dialog telling the child to go find
+        // their parent in person — a button that promised a request and delivered instructions, arriving
+        // at the exact moment of maximum frustration. See UX_IMPROVEMENT_PLAN.md §1.
+        val pendingRequest by vm.pendingTimeRequest.collectAsState(initial = null)
+        val waiting = com.shantanu.shield.remote.TimeRequests.isFresh(pendingRequest, System.currentTimeMillis())
+        if (waiting) {
+            Text(
+                "Asked for ${pendingRequest?.minutes} more minutes",
+                style = MaterialTheme.typography.bodyMedium,
+                fontWeight = FontWeight.Bold,
+                textAlign = TextAlign.Center,
+            )
+            Spacer(Modifier.height(4.dp))
+            Text(
+                // Never implies it was granted. A child told "done" who then stays locked out trusts
+                // the app less than one who was told the truth.
+                "Waiting for your parent to decide.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                textAlign = TextAlign.Center,
+            )
+            Spacer(Modifier.height(10.dp))
+            OutlinedButton(onClick = { showAsk = true }, modifier = Modifier.fillMaxWidth()) {
+                Text("Ask again")
+            }
+        } else {
+            Button(onClick = { showAsk = true }, modifier = Modifier.fillMaxWidth()) {
+                Text("Ask for more time")
+            }
         }
 
         Spacer(Modifier.height(32.dp))
@@ -535,11 +562,22 @@ private fun ChildDashboard(onParentSettings: () -> Unit) {
         AlertDialog(
             onDismissRequest = { showAsk = false },
             icon = { Icon(Icons.Default.Face, null) },
-            title = { Text("Ask for more time") },
+            title = { Text("How much more?") },
             text = {
-                Text("Only a parent can add time. Ask them — they can grant more from “Parent settings” here, or remotely from their own phone.")
+                Column {
+                    Text("Your parent will get a message and can add the time from their phone.")
+                    Spacer(Modifier.height(14.dp))
+                    // Fixed options, not free entry: one tap, and nothing for a child to negotiate up.
+                    com.shantanu.shield.remote.TimeRequests.OPTIONS.forEach { minutes ->
+                        Button(
+                            onClick = { vm.askForMoreTime(minutes); showAsk = false },
+                            modifier = Modifier.fillMaxWidth().padding(vertical = 3.dp),
+                        ) { Text("$minutes minutes") }
+                    }
+                }
             },
-            confirmButton = { TextButton(onClick = { showAsk = false }) { Text("OK") } }
+            confirmButton = {},
+            dismissButton = { TextButton(onClick = { showAsk = false }) { Text("Cancel") } }
         )
     }
 }

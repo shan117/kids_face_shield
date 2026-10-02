@@ -97,5 +97,13 @@ service cloud.firestore {
       allow get, create, update, delete: if isMember(pairingId);
       allow list: if false;
     }
+
+    // The only CHILD → PARENT channel: the child asking for more screen time. Encrypted under the
+    // pairing key for authenticity — otherwise anyone holding a pairing id could spam a parent with
+    // fake requests from their child. See UX_IMPROVEMENT_PLAN.md §1.
+    match /requests/{pairingId} {
+      allow get, create, update, delete: if isMember(pairingId);
+      allow list: if false;
+    }
   }
 }

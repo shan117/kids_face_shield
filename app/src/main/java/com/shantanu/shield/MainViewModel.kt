@@ -17,6 +17,7 @@ import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.text.SimpleDateFormat
@@ -27,6 +28,7 @@ import javax.inject.Inject
 class MainViewModel @Inject constructor(
     private val dataStoreManager: DataStoreManager,
     private val entitlements: EntitlementRepository,
+    private val requestRepository: com.shantanu.shield.remote.RequestRepository,
     @ApplicationContext private val context: Context
 ) : ViewModel() {
 
@@ -64,6 +66,36 @@ class MainViewModel @Inject constructor(
     val multiKidUnlocked = entitlements.isUnlocked(Feature.MULTI_KID_PROFILES)
     // Default-free, but convertible to premium via config: gates the Custom allow-list picker (preset C).
     val allowedPresetsUnlocked = entitlements.isUnlocked(Feature.ALLOWED_PRESETS)
+
+    // ---- "Ask for more time" (child side) — see UX_IMPROVEMENT_PLAN.md §1 ----
+
+    /** The child's pending ask. Drives the "waiting for your parent" state. */
+    val pendingTimeRequest = dataStoreManager.pendingTimeRequest
+
+    /**
+     * Send the ask.
+     *
+     * Stored locally FIRST and unconditionally, so the child sees "asked" even with no network and even
+     * in a single-device family where there is no pairing at all. The relay write is a best-effort
+     * addition on top, for a parent holding a different phone.
+     */
+    fun askForMoreTime(minutes: Int) {
+        viewModelScope.launch {
+            val request = com.shantanu.shield.remote.TimeRequests.create(minutes, System.currentTimeMillis())
+            dataStoreManager.setPendingTimeRequest(request)
+
+            val pairingId = dataStoreManager.remotePairingId.first()
+            val keyHex = dataStoreManager.remotePairingKey.first()
+            if (dataStoreManager.remoteRole.first() != "child") return@launch
+            if (pairingId.isBlank() || keyHex.isBlank()) return@launch
+
+            val sealed = com.shantanu.shield.remote.ReportCrypto.encrypt(
+                com.shantanu.shield.remote.TimeRequestCodec.encode(request),
+                com.shantanu.shield.remote.PairingManager.Pairing(pairingId, keyHex).keyBytes(),
+            )
+            requestRepository.write(pairingId, sealed)
+        }
+    }
 
     // ---- Lapse visibility for the ENFORCEMENT-only features ----
     //

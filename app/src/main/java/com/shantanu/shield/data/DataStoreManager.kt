@@ -13,6 +13,8 @@ import com.shantanu.shield.face.FaceModelConfig
 import com.shantanu.shield.remote.PairedDevice
 import com.shantanu.shield.remote.PairedDeviceCodec
 import com.shantanu.shield.remote.PairedDevices
+import com.shantanu.shield.remote.TimeRequest
+import com.shantanu.shield.remote.TimeRequestCodec
 import com.shantanu.shield.webfilter.DomainBlocklist
 import com.shantanu.shield.webfilter.WebBlockCountCodec
 import com.shantanu.shield.webfilter.WebFilterCategory
@@ -128,6 +130,12 @@ class DataStoreManager @Inject constructor(@ApplicationContext private val conte
     // Defaults OFF and is set on the child, never remotely: a parent who could switch this on from
     // their own phone would make this a covert tracker rather than a family feature.
     private val LOCATION_SHARING_KEY = booleanPreferencesKey("location_sharing_enabled")
+
+    // ---- "Ask for more time" (CHILD device) — see UX_IMPROVEMENT_PLAN.md §1 ----
+    // The child's pending ask, held locally. Local rather than only in the relay so the child's
+    // "waiting for your parent" state works with no network, and so a single-device family — where
+    // there is no pairing at all — still gets the feature.
+    private val TIME_REQUEST_KEY = stringPreferencesKey("pending_time_request")
 
     // ---- Shared entitlement (CHILD device) — see ENTITLEMENT_SHARING_PLAN.md ----
     // When the paired parent's premium covers this device, until when. The child made no purchase, so
@@ -413,6 +421,24 @@ class DataStoreManager @Inject constructor(@ApplicationContext private val conte
     // if the process dies mid-write (plan §4.1). The mirror is what lets the older read sites
     // (RemoteCommandSender, ParentReportViewModel) keep working untouched, so the data layer can ship
     // before any UI depends on it. It is removed in Phase 5.
+
+    // ---- "Ask for more time" ----
+
+    /** The child's pending ask, or null. Expiry is applied by the reader, not stored. */
+    val pendingTimeRequest: Flow<TimeRequest?> = context.dataStore.data.map { preferences ->
+        TimeRequestCodec.decode(preferences[TIME_REQUEST_KEY] ?: "")
+    }
+
+    /** Record an ask, replacing any pending one — three taps must produce one request, not three. */
+    suspend fun setPendingTimeRequest(request: TimeRequest) {
+        context.dataStore.edit { preferences ->
+            preferences[TIME_REQUEST_KEY] = TimeRequestCodec.encode(request)
+        }
+    }
+
+    suspend fun clearPendingTimeRequest() {
+        context.dataStore.edit { preferences -> preferences.remove(TIME_REQUEST_KEY) }
+    }
 
     // ---- Shared entitlement ----
 

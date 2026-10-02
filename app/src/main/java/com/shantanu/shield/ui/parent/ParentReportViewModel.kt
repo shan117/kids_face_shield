@@ -24,6 +24,10 @@ import com.shantanu.shield.remote.RemoteReportPayload
 import com.shantanu.shield.remote.RemoteReportRepository
 import com.shantanu.shield.remote.ReportCrypto
 import com.shantanu.shield.remote.ReportDoc
+import com.shantanu.shield.remote.Sealed
+import com.shantanu.shield.remote.TimeRequest
+import com.shantanu.shield.remote.TimeRequestCodec
+import com.shantanu.shield.remote.TimeRequests
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -51,6 +55,7 @@ class ParentReportViewModel @Inject constructor(
     private val commandRepository: RemoteCommandRepository,
     private val locationRepository: LocationRepository,
     private val grantRepository: com.shantanu.shield.remote.GrantRepository,
+    private val requestRepository: com.shantanu.shield.remote.RequestRepository,
     private val pairingRepository: com.shantanu.shield.remote.PairingRepository,
     /** Exposed for the UI to reverse-geocode; holds no state of its own. */
     val addressResolver: com.shantanu.shield.location.AddressResolver,
@@ -126,6 +131,7 @@ class ParentReportViewModel @Inject constructor(
             locationRepository.delete(pairingId)
             grantRepository.delete(pairingId)
             pairingRepository.delete(pairingId)
+            requestRepository.delete(pairingId)
             dataStore.removePairedDevice(pairingId)
             _states.value = _states.value - pairingId
             if (dataStore.pairedDevices.first().isEmpty()) dataStore.setRemoteRole("none")
@@ -259,8 +265,61 @@ class ParentReportViewModel @Inject constructor(
         }
     }
 
+    // ---- "Ask for more time" (parent side) — see UX_IMPROVEMENT_PLAN.md §1 ----
+
+    private val _timeRequests = MutableStateFlow<Map<String, TimeRequest>>(emptyMap())
+
+    /** The active child's pending ask, if it is still fresh. */
+    val timeRequest: StateFlow<TimeRequest?> =
+        combine(_timeRequests, activeDevice) { requests, active ->
+            val request = active?.let { requests[it.pairingId] }
+            request?.takeIf { TimeRequests.isFresh(it, System.currentTimeMillis()) }
+        }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null)
+
+    /**
+     * Grant the asked-for minutes and clear the request.
+     *
+     * Reuses the existing `GRANT_EXTRA_TIME` command, so the minutes land through the same path a
+     * parent-initiated grant uses — no second way for extensions to be applied.
+     */
+    fun grantTimeRequest() {
+        val target = activeDevice.value ?: return
+        val request = timeRequest.value ?: return
+        viewModelScope.launch {
+            commandSender.send(CommandType.GRANT_EXTRA_TIME, arg = request.minutes, target = target)
+            // Cleared whatever the send returned: leaving it pending would prompt the parent again for
+            // an ask they have already answered, and the child can always ask afresh.
+            requestRepository.delete(target.pairingId)
+            _timeRequests.value = _timeRequests.value - target.pairingId
+        }
+    }
+
+    /** Decline. The child is not told "no" explicitly — the ask simply stops being pending. */
+    fun dismissTimeRequest() {
+        val target = activeDevice.value ?: return
+        viewModelScope.launch {
+            requestRepository.delete(target.pairingId)
+            _timeRequests.value = _timeRequests.value - target.pairingId
+        }
+    }
+
+    private fun onTimeRequestSnapshot(device: PairedDevice, sealed: Sealed?) {
+        if (sealed == null) {
+            _timeRequests.value = _timeRequests.value - device.pairingId
+            return
+        }
+        val request = ReportCrypto.decrypt(sealed, device.pairing().keyBytes())
+            ?.let { TimeRequestCodec.decode(it) }
+        _timeRequests.value = if (request == null) {
+            _timeRequests.value - device.pairingId
+        } else {
+            _timeRequests.value + (device.pairingId to request)
+        }
+    }
+
     private val listeners = ListenerBag()
     private val locationListeners = ListenerBag()
+    private val requestListeners = ListenerBag()
 
     init {
         // One collector owns every subscription. It keys on the SET OF IDS rather than the device list
@@ -287,6 +346,10 @@ class ParentReportViewModel @Inject constructor(
                     locationListeners.sync(byId.keys) { id ->
                         val device = byId.getValue(id)
                         locationRepository.listen(id) { doc -> onLocationSnapshot(device, doc) }
+                    }
+                    requestListeners.sync(byId.keys) { id ->
+                        val device = byId.getValue(id)
+                        requestRepository.listen(id) { sealed -> onTimeRequestSnapshot(device, sealed) }
                     }
                 }
         }
@@ -336,6 +399,7 @@ class ParentReportViewModel @Inject constructor(
     override fun onCleared() {
         listeners.clear()
         locationListeners.clear()
+        requestListeners.clear()
         super.onCleared()
     }
 

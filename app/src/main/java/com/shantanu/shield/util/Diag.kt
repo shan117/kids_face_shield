@@ -52,11 +52,13 @@ object Diag {
     private val pollCount = AtomicLong(0)
     @Volatile private var lastPollUptime = SystemClock.elapsedRealtime()
     @Volatile private var lastMainStallMs = -1L
+    @Volatile private var logDir: File? = null
 
     fun start(context: Context) {
         if (started.getAndSet(1) == 1) return  // idempotent
         val appContext = context.applicationContext
         val file = File(appContext.filesDir, "diag.log")
+        logDir = appContext.filesDir
         val mainHandler = Handler(Looper.getMainLooper())
         scope.launch {
             runCatching {
@@ -98,6 +100,21 @@ object Diag {
                     file.appendText(line)
                 }
                 delay(INTERVAL_MS)
+            }
+        }
+    }
+
+    /**
+     * Append one timestamped event line, for diagnosing a feature on a phone whose logcat is suppressed
+     * (Realme and some Xiaomi builds hide our tags entirely). Never throws; no-op until [start] has run,
+     * because without filesDir there is nowhere to put it.
+     */
+    fun event(tag: String, message: String) {
+        val dir = logDir ?: return
+        scope.launch {
+            runCatching {
+                val line = "${iso(System.currentTimeMillis())},EVENT,$tag,$message"
+                File(dir, "diag.log").appendText(line + System.lineSeparator())
             }
         }
     }

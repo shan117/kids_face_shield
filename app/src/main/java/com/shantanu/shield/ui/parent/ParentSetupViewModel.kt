@@ -38,6 +38,7 @@ class ParentSetupViewModel @Inject constructor(
     private val locationRepository: com.shantanu.shield.remote.LocationRepository,
     private val grantRepository: com.shantanu.shield.remote.GrantRepository,
     private val pairingRepository: com.shantanu.shield.remote.PairingRepository,
+    private val requestRepository: com.shantanu.shield.remote.RequestRepository,
 ) : ViewModel() {
 
     /** Sync cadence — "daily" or "weekly" (default). */
@@ -70,6 +71,7 @@ class ParentSetupViewModel @Inject constructor(
                 locationRepository.delete(oldId)
                 grantRepository.delete(oldId)
                 pairingRepository.delete(oldId)
+                requestRepository.delete(oldId)
             }
             val pairing = PairingManager.newPairing()
             dataStore.setRemotePairing(pairing.pairingIdHex, pairing.keyHex)
@@ -303,6 +305,7 @@ class ParentSetupViewModel @Inject constructor(
                     locationRepository.delete(replacing)
                     grantRepository.delete(replacing)
                     pairingRepository.delete(replacing)
+                    requestRepository.delete(replacing)
                     dataStore.removePairedDevice(replacing)
                 }
                 old?.label
@@ -366,6 +369,7 @@ class ParentSetupViewModel @Inject constructor(
                 locationRepository.delete(id)
                 grantRepository.delete(id)
                 pairingRepository.delete(id)
+                requestRepository.delete(id)
             }
             dataStore.clearRemotePairing()
         }

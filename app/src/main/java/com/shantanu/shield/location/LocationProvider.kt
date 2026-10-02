@@ -10,15 +10,22 @@ import android.location.LocationManager
 import android.os.BatteryManager
 import android.os.Build
 import android.os.Bundle
+import android.os.CancellationSignal
+import android.os.Handler
+import android.os.HandlerThread
 import android.os.Looper
 import android.util.Log
 import androidx.core.content.ContextCompat
 import com.shantanu.shield.remote.FixStatus
 import com.shantanu.shield.remote.LocationFix
+import com.shantanu.shield.util.Diag
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withTimeout
+import java.util.concurrent.Executor
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import javax.inject.Inject
 import javax.inject.Singleton
 import kotlin.coroutines.resume
@@ -85,43 +92,121 @@ class LocationProvider @Inject constructor(
             ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_COARSE_LOCATION) ==
             android.content.pm.PackageManager.PERMISSION_GRANTED
 
-    private fun isLocationEnabled(manager: LocationManager): Boolean = runCatching {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) manager.isLocationEnabled
-        else manager.isProviderEnabled(LocationManager.GPS_PROVIDER) ||
-            manager.isProviderEnabled(LocationManager.NETWORK_PROVIDER)
-    }.getOrDefault(false)
+    /**
+     * Is location switched on, on THIS device?
+     *
+     * Two independent signals, and an unknown answer means "try anyway". Reporting LOCATION_DISABLED
+     * when the query merely failed is worse than attempting and timing out: that status sends the parent
+     * to a setting on the child's phone that is already correct, so the real cause never gets found. An
+     * enabled provider proves location is on whatever the master flag claims.
+     */
+    private fun isLocationEnabled(manager: LocationManager): Boolean {
+        val master = runCatching {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) manager.isLocationEnabled else null
+        }.getOrNull()
+        val anyProvider = runCatching {
+            manager.isProviderEnabled(LocationManager.GPS_PROVIDER) ||
+                manager.isProviderEnabled(LocationManager.NETWORK_PROVIDER)
+        }.getOrNull()
+
+        val enabled = when {
+            master == true || anyProvider == true -> true
+            master == false || anyProvider == false -> false
+            else -> true   // both queries failed — let the fix attempt report the truth
+        }
+        Log.i(TAG, "location enabled check: master=$master providers=$anyProvider -> $enabled")
+        Diag.event(TAG, "enabled master=$master providers=$anyProvider -> $enabled")
+        return enabled
+    }
 
     /**
-     * One fix from the first provider that answers.
+     * One fix from the first provider that answers, acquired entirely OFF the main thread.
      *
-     * GPS and network are requested together rather than in sequence: indoors GPS may never fix while
+     * Every provider is asked at once rather than in sequence: indoors GPS may never fix while fused or
      * network answers in a second, and trying them one at a time would spend the whole budget waiting
      * for the one that was never going to work.
+     *
+     * Callbacks are delivered on a private [HandlerThread], never on the main looper. This service
+     * saturates the main thread — measuring that stall is the entire reason `Diag` exists — and a
+     * location callback queued behind a backed-up main looper simply never arrives inside the budget.
+     * The fix would be acquired and then thrown away, surfacing to the parent as "couldn't get a fix"
+     * while the GPS was working perfectly.
+     *
+     * On API 30+ this uses the one-shot `getCurrentLocation`, which is built for exactly this ("where is
+     * this phone, once") and will hand back a usable recent fix immediately instead of waiting for the
+     * next hardware update. The listener path remains for older devices.
      */
     @Suppress("MissingPermission")   // guarded by hasPermission() above
-    private suspend fun awaitFix(manager: LocationManager): Location? =
-        suspendCancellableCoroutine { cont ->
-            val providers = listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER)
-                .filter { runCatching { manager.isProviderEnabled(it) }.getOrDefault(false) }
+    private suspend fun awaitFix(manager: LocationManager): Location? {
+        val providers = candidateProviders()
+            .filter { runCatching { manager.isProviderEnabled(it) }.getOrDefault(false) }
 
-            if (providers.isEmpty()) {
-                cont.resume(null)
-                return@suspendCancellableCoroutine
+        Log.i(TAG, "requesting fix from providers=$providers")
+        Diag.event(TAG, "providers=$providers")
+        if (providers.isEmpty()) {
+            Log.w(TAG, "no provider enabled despite location being on")
+            return null
+        }
+
+        val thread = HandlerThread("ShieldLocationFix").apply { start() }
+        return try {
+            awaitFixOn(manager, providers, Handler(thread.looper))
+        } finally {
+            // The thread exists only for the duration of one fix; leaving it parked would be a thread
+            // leak on a device this app is trying to keep alive for days.
+            runCatching { thread.quitSafely() }
+        }
+    }
+
+    @Suppress("MissingPermission")
+    private suspend fun awaitFixOn(
+        manager: LocationManager,
+        providers: List<String>,
+        handler: Handler,
+    ): Location? = suspendCancellableCoroutine { cont ->
+        val settled = AtomicBoolean(false)
+        /** Counts providers that answered with nothing, so "all failed" is distinct from "still trying". */
+        val outstanding = AtomicInteger(providers.size)
+
+        fun succeed(location: Location, cleanup: () -> Unit) {
+            if (!settled.compareAndSet(false, true)) return
+            runCatching(cleanup)
+            Log.i(TAG, "fix from ${location.provider} accuracy=${location.accuracy}")
+            Diag.event(TAG, "fix provider=${location.provider} acc=${location.accuracy}")
+            if (cont.isActive) cont.resume(location)
+        }
+
+        fun failOne(cleanup: () -> Unit) {
+            if (outstanding.decrementAndGet() > 0) return
+            if (!settled.compareAndSet(false, true)) return
+            runCatching(cleanup)
+            Log.w(TAG, "every provider answered with no location")
+            Diag.event(TAG, "all providers returned null")
+            if (cont.isActive) cont.resume(null)
+        }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val signal = CancellationSignal()
+            val executor = Executor { handler.post(it) }
+            val cleanup = { signal.cancel() }
+            cont.invokeOnCancellation { runCatching { signal.cancel() } }
+
+            runCatching {
+                for (provider in providers) {
+                    manager.getCurrentLocation(provider, signal, executor) { location ->
+                        if (location != null) succeed(location, cleanup) else failOne(cleanup)
+                    }
+                }
+            }.onFailure {
+                Log.w(TAG, "getCurrentLocation failed", it)
+                if (settled.compareAndSet(false, true) && cont.isActive) cont.resume(null)
             }
-
-            // Guarded so the first provider to answer wins and the rest are torn down exactly once.
-            var settled = false
+        } else {
             lateinit var listener: LocationListener
-
-            fun finish(result: Location?) {
-                if (settled) return
-                settled = true
-                runCatching { manager.removeUpdates(listener) }
-                if (cont.isActive) cont.resume(result)
-            }
+            val cleanup = { manager.removeUpdates(listener) }
 
             listener = object : LocationListener {
-                override fun onLocationChanged(location: Location) = finish(location)
+                override fun onLocationChanged(location: Location) = succeed(location, cleanup)
                 override fun onProviderDisabled(provider: String) { /* another may still answer */ }
                 override fun onProviderEnabled(provider: String) {}
                 @Deprecated("Required on API < 29")
@@ -134,20 +219,43 @@ class LocationProvider @Inject constructor(
 
             runCatching {
                 for (provider in providers) {
-                    manager.requestLocationUpdates(provider, 0L, 0f, listener, Looper.getMainLooper())
+                    manager.requestLocationUpdates(provider, 0L, 0f, listener, handler.looper)
                 }
             }.onFailure {
                 Log.w(TAG, "requestLocationUpdates failed", it)
-                finish(null)
+                if (settled.compareAndSet(false, true)) {
+                    runCatching(cleanup)
+                    if (cont.isActive) cont.resume(null)
+                }
             }
         }
+    }
+
+    /**
+     * Providers to ask, best first.
+     *
+     * FUSED is the one that answers indoors — it blends wifi and cell with no Play Services dependency
+     * (platform API since 31). Without it the only indoor hope was NETWORK, which on several recent
+     * devices is either absent or never answers, so a request from inside a house spent the whole 45 s
+     * budget on a GPS fix that was never coming.
+     */
+    private fun candidateProviders(): List<String> = buildList {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) add(LocationManager.FUSED_PROVIDER)
+        add(LocationManager.GPS_PROVIDER)
+        add(LocationManager.NETWORK_PROVIDER)
+    }
 
     @Suppress("MissingPermission")
     private fun lastKnown(manager: LocationManager): Location? = runCatching {
-        listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER)
+        val all = candidateProviders()
             .mapNotNull { runCatching { manager.getLastKnownLocation(it) }.getOrNull() }
-            .filter { System.currentTimeMillis() - it.time <= LAST_KNOWN_MAX_AGE_MS }
-            .maxByOrNull { it.time }
+        val newest = all.maxByOrNull { it.time }
+        // Logged with its age because "no cached fix" and "cached fix just too old" send you to very
+        // different places, and from the parent's phone both look identical.
+        val age = newest?.let { System.currentTimeMillis() - it.time } ?: -1
+        Log.i(TAG, "lastKnown candidates=${all.size} newestAgeMs=$age")
+        Diag.event(TAG, "lastKnown n=${all.size} ageMs=$age")
+        newest?.takeIf { System.currentTimeMillis() - it.time <= LAST_KNOWN_MAX_AGE_MS }
     }.getOrNull()
 
     private fun batteryPct(): Int = runCatching {

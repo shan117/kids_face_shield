@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
@@ -238,6 +239,44 @@ fun ParentReportPane(
             onApplyCustomAllowed = viewModel::setChildCustomAllowed,
             onSetPerAppLimit = viewModel::setChildPerAppLimit,
         )
+
+        // A pending ask goes FIRST, above the report. It is time-sensitive and the child is actively
+        // waiting; burying it under charts would recreate the problem this feature fixes.
+        val pendingAsk by viewModel.timeRequest.collectAsState()
+        pendingAsk?.let { ask ->
+            val childLabel = activeDevice?.label ?: "Your child"
+            Spacer(Modifier.height(12.dp))
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(20.dp),
+                colors = CardDefaults.cardColors(
+                    containerColor = MaterialTheme.colorScheme.tertiaryContainer
+                ),
+            ) {
+                Column(Modifier.padding(20.dp)) {
+                    Text(
+                        "$childLabel is asking for more time",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onTertiaryContainer,
+                    )
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        "They'd like ${ask.minutes} more minutes today.",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onTertiaryContainer.copy(alpha = 0.9f),
+                    )
+                    Spacer(Modifier.height(14.dp))
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Button(onClick = viewModel::grantTimeRequest, shape = RoundedCornerShape(12.dp)) {
+                            Text("Give ${ask.minutes} min", fontWeight = FontWeight.Bold)
+                        }
+                        Spacer(Modifier.width(10.dp))
+                        TextButton(onClick = viewModel::dismissTimeRequest) { Text("Not now") }
+                    }
+                }
+            }
+        }
 
         // Location. Placed after the report so the screen-time answer — the reason the parent opened
         // this — still comes first.

@@ -36,6 +36,8 @@ import com.shantanu.shield.premium.EntitlementRepository
 import com.shantanu.shield.premium.Feature
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
 import com.shantanu.shield.remote.CommandType
 import com.shantanu.shield.remote.RemoteCommandApplier
 import com.shantanu.shield.remote.RemoteCommandRepository
@@ -55,11 +57,15 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
     @Inject lateinit var locationResponder: com.shantanu.shield.location.LocationResponder
     @Inject lateinit var privateDnsMonitor: com.shantanu.shield.webfilter.PrivateDnsMonitor
     @Inject lateinit var grantRepository: com.shantanu.shield.remote.GrantRepository
+    @Inject lateinit var requestRepository: com.shantanu.shield.remote.RequestRepository
 
     // Live Firestore listener for parent→child commands (Remote Control); null unless this is a paired,
     // control-enabled child. Re-attached on state change; removed in onDestroy.
     private var commandListener: com.google.firebase.firestore.ListenerRegistration? = null
     private var grantListener: com.google.firebase.firestore.ListenerRegistration? = null
+    private val requestListeners = com.shantanu.shield.remote.ListenerBag()
+    /** Dedupes the replayed snapshot a Firestore listener delivers on reconnect. */
+    @Volatile private var lastNotifiedTimeRequest: String? = null
     private val serviceScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
     
     private lateinit var windowManager: WindowManager
@@ -251,6 +257,8 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
         const val LOCATION_NOTIFICATION_ID = 103
         /** "Web filtering turned off" notice. */
         const val WEB_FILTER_NOTIFICATION_ID = 104
+        /** "Your child is asking for more time". */
+        const val TIME_REQUEST_NOTIFICATION_ID = 105
         /** Once a day. One tiny document per linked child — cheap, and bounds how long a cancelled
          *  family keeps premium to the lease window rather than to this interval. */
         const val GRANT_RENEWAL_INTERVAL_MS = 24L * 60 * 60 * 1000
@@ -320,6 +328,32 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
                 runCatching { renewPremiumGrants() }
                 delay(GRANT_RENEWAL_INTERVAL_MS)
             }
+        }
+
+        // PARENT side: hear the child asking for more time.
+        //
+        // The only child→parent channel in the app, and the reason it exists: the child's "Ask for more
+        // time" button used to open a dialog telling them to go find their parent in person. A request
+        // nobody receives is what makes a child campaign to have the app removed.
+        // Attaches only OUTSIDE the child role, mirroring the grant listener below. A device that was a
+        // parent and later became a child keeps its old pairedDevices entries and their keys, so without
+        // this guard a child's phone would decrypt its former children's asks and raise parent
+        // notifications on it.
+        serviceScope.launch {
+            combine(
+                dataStoreManager.remoteRole,
+                dataStoreManager.pairedDevices,
+            ) { role, devices -> if (role == "child") emptyList() else devices }
+                .map { devices -> devices.associateBy { it.pairingId } }
+                .distinctUntilChanged { old, new -> old.keys == new.keys }
+                .collect { byId ->
+                    requestListeners.sync(byId.keys) { id ->
+                        val device = byId.getValue(id)
+                        requestRepository.listen(id) { sealed ->
+                            serviceScope.launch { onTimeRequest(device, sealed) }
+                        }
+                    }
+                }
         }
 
         // CHILD side: adopt grants the paired parent publishes. Attaches only in the child role — a
@@ -856,6 +890,35 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
      * Silent no-op unless this is a paired parent that actually owns a subscription — so a child device
      * or a free parent never writes anything.
      */
+    /**
+     * Parent: a child is asking for more time.
+     *
+     * Notifies once per distinct ask. Stale requests are ignored — a parent clearing notifications in
+     * the evening must not be prompted about an ask from breakfast, because the child's situation has
+     * moved on and time granted for a forgotten reason reads as the app behaving randomly.
+     */
+    private suspend fun onTimeRequest(
+        device: com.shantanu.shield.remote.PairedDevice,
+        sealed: com.shantanu.shield.remote.Sealed?,
+    ) {
+        if (sealed == null) return
+        val plaintext = com.shantanu.shield.remote.ReportCrypto
+            .decrypt(sealed, device.pairing().keyBytes()) ?: return
+        val request = com.shantanu.shield.remote.TimeRequestCodec.decode(plaintext) ?: return
+
+        if (!com.shantanu.shield.remote.TimeRequests.isFresh(request, System.currentTimeMillis())) {
+            Log.i("AppLock", "time request from ${device.label} is stale — ignored")
+            return
+        }
+        // The listener replays on reconnect; without this a single ask could notify repeatedly.
+        val key = "${device.pairingId}:${request.requestedAtMs}"
+        if (key == lastNotifiedTimeRequest) return
+        lastNotifiedTimeRequest = key
+
+        Log.i("AppLock", "time request: ${device.label} asked for ${request.minutes} min")
+        postTimeRequestNotification(device.label, request.minutes)
+    }
+
     private suspend fun renewPremiumGrants() {
         if (dataStoreManager.remoteRole.first() != "parent") return
         if (!entitlementRepository.isPremium.first()) return
@@ -1505,10 +1568,22 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
             // what lets the app read location without ACCESS_BACKGROUND_LOCATION at all.
             if (useLocation && locationProvider.hasPermission()) {
                 type = type or ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
+            } else if (useLocation) {
+                Log.w("AppLock", "location fix requested but the runtime permission is not held")
             }
             try {
                 startForeground(NOTIFICATION_ID, notification, type)
             } catch (e: Exception) {
+                // Dropping to SPECIAL_USE also drops `location`, and with a foreground-only location
+                // permission that makes every subsequent read return nothing at all — which surfaces to
+                // the parent as "couldn't get a fix", blaming signal for a permission problem. Must be
+                // loud: it is otherwise invisible from both phones.
+                Log.e(
+                    "AppLock",
+                    "startForeground(type=$type camera=$useCamera location=$useLocation) failed — " +
+                        "falling back to SPECIAL_USE; location reads will now return nothing",
+                    e,
+                )
                 startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
             }
         } else {
@@ -1594,6 +1669,35 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
      * cannot see is a tracker; this notification is what keeps this a family feature.
      * See LOCATION_FEATURE_PLAN.md §10.
      */
+    /**
+     * "Aarav is asking for 15 more minutes."
+     *
+     * Tapping opens the app, where the request card offers Grant / Not now. Deliberately not an
+     * action button on the notification itself: granting screen time from a lock screen, with no
+     * context about how much the child has already used today, is a decision a parent would regret.
+     */
+    private fun postTimeRequestNotification(childLabel: String, minutes: Int) {
+        val openIntent = PendingIntent.getActivity(
+            this, 0,
+            Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        val notification = NotificationCompat.Builder(this, FREE_PLAY_CHANNEL_ID)
+            .setSmallIcon(android.R.drawable.ic_dialog_info)
+            .setContentTitle("$childLabel is asking for more time")
+            .setContentText("They'd like $minutes more minutes. Tap to decide.")
+            .setContentIntent(openIntent)
+            .setAutoCancel(true)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .build()
+        try {
+            getSystemService(NotificationManager::class.java)
+                .notify(TIME_REQUEST_NOTIFICATION_ID, notification)
+        } catch (e: SecurityException) {
+            Log.w("AppLock", "POST_NOTIFICATIONS not granted; skipping time-request notification")
+        }
+    }
+
     private fun postLocationSharedNotification() {
         val openIntent = PendingIntent.getActivity(
             this, 0,
@@ -1880,6 +1984,7 @@ class AppLockForegroundService : Service(), LifecycleOwner, SavedStateRegistryOw
         mainHandler.removeCallbacks(downgradeFgsTask)
         commandListener?.remove()
         grantListener?.remove()
+        requestListeners.clear()
         serviceLifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_DESTROY)
         serviceScope.cancel()
     }

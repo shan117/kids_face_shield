@@ -1,0 +1,16 @@
+[29w] FaceLockOverlayContent.kt:376
+    क्या आपको पता है? ज़्यादा देर तक फ़ोन देखने से आपकी आँखें ख़राब हो सकती हैं। आपको चश्मे लग सकते हैं। आपकी एकाग्रता की शक्ति कम हो सकती है।
+[29w] FaceLockOverlayContent.kt:179
+    क्या आपको पता है? ज़्यादा देर तक फ़ोन देखने से आपकी आँखें ख़राब हो सकती हैं। आपको चश्मे लग सकते हैं। आपकी एकाग्रता की शक्ति कम हो सकती है।
+[10w] MainActivity.kt:1221
+    Off — tap to set up budget & allowed apps
+[8w] PremiumGate.kt:37
+    Subscribe to Kids Shield Plus to use this.
+[8w] ParentReportScreen.kt:718
+    ${customAllowedNow.size} always-allowed · ${perAppLimitsNow.size} with a per-app limit
+[8w] MainActivity.kt:1960
+    No app activity tracked for this period yet.
+[8w] MainActivity.kt:1063
+    Shield ON · ${protectedApps.size} app${if (protectedApps.size == 1) 
+[8w] LocationSection.kt:168
+    See every place you've looked them up before.
